@@ -59,7 +59,7 @@ io.on('connection', (socket) => {
   socket.on('find_partner', (userData) => {
     socket.userData = userData; 
 
-    // DELAY 1: Force 3s wait (for Ad visibility)
+    // DELAY 1: Wait 2 seconds (was 3000)
     setTimeout(() => {
       if (!socket.connected) return;
 
@@ -94,7 +94,7 @@ io.on('connection', (socket) => {
       };
       waitingQueue.push(queueItem);
 
-      // DELAY 2: Wait 7s before accepting randoms
+      // DELAY 2: Wait 3 more seconds (Total 5s) before accepting randoms
       setTimeout(() => {
         const currentEntry = waitingQueue.find(u => u.socket.id === socket.id);
         if (currentEntry) {
@@ -104,9 +104,9 @@ io.on('connection', (socket) => {
             matchUsers(socket, anyMatch.socket);
           }
         }
-      }, 7000); 
+      }, 3000); // <--- Changed from 7000 to 3000
 
-    }, 3000); 
+    }, 2000); // <--- Changed from 3000 to 2000
   });
 
   socket.on('send_message', (messageData) => {
