@@ -6,6 +6,11 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
+// --- FIX 1: Add a Home Route so you can check if the server is alive ---
+app.get("/", (req, res) => {
+  res.send("ChatItNow Server is Running!");
+});
+
 const server = http.createServer(app);
 
 // Cloud port configuration
@@ -13,8 +18,13 @@ const PORT = process.env.PORT || 3001;
 
 const io = new Server(server, {
   cors: {
-    // SECURITY: Once you have your domain, replace "*" with ["https://chatitnow.com", "http://localhost:5173"]
-    origin: "*", 
+    // --- FIX 2: Explicitly list your domains for better reliability ---
+    origin: [
+      "https://chatitnow.com",
+      "https://www.chatitnow.com",
+      "http://localhost:5173",        // For local testing
+      "https://chatitnow-frontend.vercel.app" // For Vercel preview
+    ],
     methods: ["GET", "POST"]
   }
 });
@@ -133,4 +143,6 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => handleDisconnect(socket));
 });
 
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`SERVER RUNNING ON PORT ${PORT}`);
+});
