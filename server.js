@@ -6,7 +6,7 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
-// --- FIX 1: Add a Home Route so you can check if the server is alive ---
+// Home Route to check if server is alive
 app.get("/", (req, res) => {
   res.send("ChatItNow Server is Running!");
 });
@@ -18,7 +18,6 @@ const PORT = process.env.PORT || 3001;
 
 const io = new Server(server, {
   cors: {
-    // --- FIX 2: Explicitly list your domains for better reliability ---
     origin: [
       "https://chatitnow.com",
       "https://www.chatitnow.com",
@@ -59,7 +58,7 @@ io.on('connection', (socket) => {
   socket.on('find_partner', (userData) => {
     socket.userData = userData; 
 
-    // DELAY 1: Wait 2 seconds (was 3000)
+    // DELAY 1: Wait 3 seconds (Good for AdSense Viewability)
     setTimeout(() => {
       if (!socket.connected) return;
 
@@ -94,7 +93,7 @@ io.on('connection', (socket) => {
       };
       waitingQueue.push(queueItem);
 
-      // DELAY 2: Wait 3 more seconds (Total 5s) before accepting randoms
+      // DELAY 2: Wait 2 more seconds (Total 5s) before accepting randoms
       setTimeout(() => {
         const currentEntry = waitingQueue.find(u => u.socket.id === socket.id);
         if (currentEntry) {
@@ -104,9 +103,9 @@ io.on('connection', (socket) => {
             matchUsers(socket, anyMatch.socket);
           }
         }
-      }, 3000); // <--- Changed from 7000 to 3000
+      }, 2000); // <--- Changed to 2000 (2 seconds)
 
-    }, 2000); // <--- Changed from 3000 to 2000
+    }, 3000); // <--- Changed to 3000 (3 seconds)
   });
 
   socket.on('send_message', (messageData) => {
