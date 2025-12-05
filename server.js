@@ -163,7 +163,9 @@ io.on('connection', (socket) => {
     if (socket.roomID) {
       socket.to(socket.roomID).emit('receive_message', {
         text: messageData.text,
-        type: 'stranger'
+        type: 'stranger',
+        // PASS THE REPLY DATA THROUGH
+        replyTo: messageData.replyTo 
       });
     }
   });
