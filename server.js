@@ -17,7 +17,10 @@ const PORT = process.env.PORT || 3001;
 // --- CONFIGURATION ---
 const INACTIVITY_LIMIT = 10 * 60 * 1000; // 10 Minutes
 const RECONNECT_GRACE_PERIOD = 3 * 60 * 1000; // 3 Minutes
-const AD_DELAY_MS = 3000; // 3 Seconds mandatory wait for Ads
+
+// --- TIMING CONFIG ---
+const PHASE_1_DELAY = 3000; // Wait 3s for Ad/Same Field
+const PHASE_2_DELAY = 2000; // Wait additional 2s for Random
 
 const io = new Server(server, {
   connectionStateRecovery: {
@@ -34,7 +37,6 @@ const io = new Server(server, {
 
 // --- GLOBAL STATE ---
 let waitingQueue = []; 
-// Session Map: Key = sessionID, Value = { socketId, roomID, userData, timer }
 const sessionMap = new Map(); 
 
 // --- HELPER FUNCTIONS ---
@@ -56,26 +58,24 @@ function cleanupSession(sessionID) {
   
   if (session.timer) clearTimeout(session.timer);
   
-  // Notify partner if they were in a room
+  // Notify partner
   if (session.roomID) {
     io.to(session.roomID).emit('partner_disconnected');
     io.in(session.roomID).socketsLeave(session.roomID);
   }
   
-  // Important: We DON'T delete the sessionMap entry here entirely 
-  // because the user might just be in the queue. 
-  // We only remove them from the queue and clear room data.
-  session.roomID = null;
   removeFromQueue(sessionID);
+  sessionMap.delete(sessionID);
 }
 
 function executeMatch(sessionID1, sessionID2) {
   const socket1 = getSocketFromSession(sessionID1);
   const socket2 = getSocketFromSession(sessionID2);
 
-  // If a user disconnected while waiting
+  // If one disconnected during the wait
   if (!socket1 || !socket2) {
     if (socket1) {
+       // Reset match flag so they can be picked up by someone else
        const entry = waitingQueue.find(u => u.sessionID === sessionID1);
        if (entry) entry.isMatched = false; 
     }
@@ -94,11 +94,9 @@ function executeMatch(sessionID1, sessionID2) {
   socket1.roomID = roomID;
   socket2.roomID = roomID;
 
-  // Update session map
   if (sessionMap.has(sessionID1)) sessionMap.get(sessionID1).roomID = roomID;
   if (sessionMap.has(sessionID2)) sessionMap.get(sessionID2).roomID = roomID;
 
-  // Remove from queue
   removeFromQueue(sessionID1);
   removeFromQueue(sessionID2);
 
@@ -147,33 +145,25 @@ io.on('connection', (socket) => {
   if (sessionMap.has(sessionID)) {
     const session = sessionMap.get(sessionID);
     
-    // Update live socket ID
     session.socketId = socket.id;
+    socket.userData = session.userData;
+    socket.roomID = session.roomID;
 
-    // Stop disconnect timer
     if (session.timer) {
-      console.log(`Restored session: ${sessionID}`);
       clearTimeout(session.timer);
       session.timer = null;
     }
 
-    // Restore data
-    socket.userData = session.userData;
-    socket.roomID = session.roomID;
-
-    // Rejoin Room
     if (session.roomID) {
       socket.join(session.roomID);
       socket.to(session.roomID).emit('partner_connected'); 
       socket.emit('session_restored', { status: 'connected' });
     } else {
-      // If queueing, update socket ref
       const queueItem = waitingQueue.find(q => q.sessionID === sessionID);
       if (queueItem) queueItem.socket = socket;
     }
 
   } else {
-    // New Session
     sessionMap.set(sessionID, { 
       socketId: socket.id, 
       roomID: null, 
@@ -186,29 +176,25 @@ io.on('connection', (socket) => {
     socket.lastActive = Date.now();
   });
 
-  // --- SEARCH LOGIC (FIXED FOR REMATCHING) ---
+  // --- SEARCH LOGIC (3s Priority -> 2s Wait -> Any) ---
   socket.on('find_partner', (userData) => {
     socket.userData = userData;
-    
-    // 1. HARD RESET SESSION STATE
-    // This ensures that even if the server thought they were in a room, 
-    // they are now officially looking for a new partner.
+
+    // 1. HARD RESET: Clear previous room data from session
     if (sessionMap.has(socket.sessionID)) {
       const session = sessionMap.get(socket.sessionID);
+      session.userData = userData; // Update preference
       
-      // If they were in a room, leave it silently (logic handled by disconnect_partner usually, but safety first)
       if (session.roomID) {
         socket.leave(session.roomID);
         session.roomID = null;
       }
-      
-      session.userData = userData;
     }
 
-    // 2. Remove from queue if already there
+    // 2. Clear from queue just in case
     removeFromQueue(socket.sessionID);
 
-    // 3. Add to Queue
+    // 3. Add to Queue immediately
     const myEntry = { 
       sessionID: socket.sessionID, 
       socket: socket, 
@@ -221,16 +207,15 @@ io.on('connection', (socket) => {
 
     const isGenericField = userData.field === '' || userData.field === 'Others';
 
-    // 4. Wait 3 Seconds (Ad View)
+    // --- PHASE 1: Wait 3 Seconds (Ad View) ---
     setTimeout(() => {
-      // Check if user is still valid
+      // Valid check
       const currentEntry = waitingQueue.find(u => u.sessionID === socket.sessionID);
       if (!currentEntry || currentEntry.isMatched) return;
 
-      // GET FRESH CANDIDATES (This includes people who might have just joined or re-joined)
       const candidates = waitingQueue.filter(u => u.sessionID !== socket.sessionID && !u.isMatched);
       
-      // A. Priority Match
+      // Try Priority Match (Same Field)
       if (!isGenericField) {
         const exactMatch = candidates.find(u => 
           u.userData.field === userData.field && 
@@ -242,28 +227,39 @@ io.on('connection', (socket) => {
           currentEntry.isMatched = true;
           exactMatch.isMatched = true;
           executeMatch(socket.sessionID, exactMatch.sessionID);
-          return;
+          return; // Match found, stop here.
         }
       }
 
-      // B. Switch to Open Mode
-      currentEntry.openToAny = true;
+      // --- PHASE 2: Wait Additional 2 Seconds ---
+      setTimeout(() => {
+        // Valid check again
+        const reCheckEntry = waitingQueue.find(u => u.sessionID === socket.sessionID);
+        if (!reCheckEntry || reCheckEntry.isMatched) return;
 
-      // C. Any Match
-      const anyMatch = candidates.find(u => {
-        if (u.openToAny) return true; 
-        return u.userData.field === userData.field;
-      });
+        // Switch to "Open" mode
+        reCheckEntry.openToAny = true;
 
-      if (anyMatch) {
-        currentEntry.isMatched = true;
-        anyMatch.isMatched = true;
-        executeMatch(socket.sessionID, anyMatch.sessionID);
-      }
-      // If no match found, they stay in queue with openToAny = true
-      // The next person who finishes their 3s timer will find them.
+        // Try Any Match
+        // We match if:
+        // 1. They are also Open (Desperate)
+        // 2. OR I match THEIR priority field (I am their perfect match)
+        const openCandidates = waitingQueue.filter(u => u.sessionID !== socket.sessionID && !u.isMatched);
+        
+        const anyMatch = openCandidates.find(u => {
+          if (u.openToAny) return true; // They match anyone
+          return u.userData.field === userData.field; // I match them
+        });
 
-    }, AD_DELAY_MS);
+        if (anyMatch) {
+          reCheckEntry.isMatched = true;
+          anyMatch.isMatched = true;
+          executeMatch(socket.sessionID, anyMatch.sessionID);
+        }
+
+      }, PHASE_2_DELAY); // +2 Seconds
+
+    }, PHASE_1_DELAY); // 3 Seconds
   });
 
   socket.on('send_message', (messageData) => {
@@ -290,11 +286,14 @@ io.on('connection', (socket) => {
     }
   });
 
+  // --- MANUAL DISCONNECT ---
   socket.on('disconnect_partner', () => {
-    // Just clear the room, don't delete the session (they might search again)
     const session = sessionMap.get(socket.sessionID);
     if (session && session.roomID) {
-      io.to(session.roomID).emit('partner_disconnected');
+      // Notify ONLY the partner that I left
+      socket.to(session.roomID).emit('partner_disconnected');
+      
+      // Clear the room logic
       io.in(session.roomID).socketsLeave(session.roomID);
       session.roomID = null;
     }
@@ -313,16 +312,12 @@ io.on('connection', (socket) => {
         socket.to(session.roomID).emit('partner_reconnecting_server');
         
         session.timer = setTimeout(() => {
-          // If they don't return in 3 mins, fully clean them up
-          if (session.roomID) { // Check again in case they reconnected
-             io.to(session.roomID).emit('partner_disconnected');
-             io.in(session.roomID).socketsLeave(session.roomID);
-             session.roomID = null;
-          }
+          console.log(`Session expired: ${socket.sessionID}`);
+          cleanupSession(socket.sessionID);
         }, RECONNECT_GRACE_PERIOD);
-      } 
-      // If they were just in queue or idle, we can keep the session in memory 
-      // for a bit in case they refresh, but no need to panic.
+      } else {
+        sessionMap.delete(socket.sessionID);
+      }
     }
   });
 });
