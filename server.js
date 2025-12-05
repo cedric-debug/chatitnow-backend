@@ -6,29 +6,28 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
-// Home Route
 app.get("/", (req, res) => {
   res.send("ChatItNow Server is Running!");
 });
 
 const server = http.createServer(app);
-
-// Cloud port configuration
 const PORT = process.env.PORT || 3001;
 
-// 10 Minutes in milliseconds
+// 10 Minutes max session idle time
 const INACTIVITY_LIMIT = 10 * 60 * 1000; 
 
+// --- UPDATED: 1 Minute grace period for internet drops ---
+const RECONNECT_GRACE_PERIOD = 60 * 1000; 
+
 const io = new Server(server, {
-  // This helps mobile stay connected if signal drops
   connectionStateRecovery: {
-    maxDisconnectionDuration: INACTIVITY_LIMIT,
+    // This allows the server to restore the socket session (ID, Rooms) 
+    // if the client reconnects quickly.
+    maxDisconnectionDuration: 2 * 60 * 1000, 
     skipMiddlewares: true,
   },
-  // This kills dead connections (network loss)
-  pingTimeout: INACTIVITY_LIMIT, 
+  pingTimeout: 60000, 
   pingInterval: 25000,
-  
   cors: {
     origin: [
       "https://chatitnow.com",
@@ -41,18 +40,18 @@ const io = new Server(server, {
 });
 
 let waitingQueue = [];
+// Store timeouts so we can cancel them if user reconnects
+const disconnectTimers = new Map(); 
 
-// --- IDLE CHECKER (Applies to Desktop & Mobile) ---
-// This ensures users are kicked if they are truly idle (not typing/interacting)
+// --- IDLE CHECKER ---
 setInterval(() => {
   const now = Date.now();
   io.sockets.sockets.forEach((socket) => {
     if (socket.lastActive && (now - socket.lastActive > INACTIVITY_LIMIT)) {
-      console.log(`Disconnecting inactive user: ${socket.id}`);
       socket.disconnect(true);
     }
   });
-}, 60 * 1000); // Check every minute
+}, 60 * 1000);
 
 const matchUsers = (socket1, socket2) => {
   const roomID = `${socket1.id}#${socket2.id}`;
@@ -76,24 +75,65 @@ const matchUsers = (socket1, socket2) => {
   });
 };
 
-io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
-  
-  // Track activity
-  socket.lastActive = Date.now();
+// --- CLEANUP FUNCTION ---
+const performDisconnect = (userSocket) => {
+  // Remove from queue
+  waitingQueue = waitingQueue.filter(s => s.socket.id !== userSocket.id);
 
-  if (socket.recovered) {
-    console.log(`User ${socket.id} recovered connection`);
+  // Remove from timers
+  if (disconnectTimers.has(userSocket.id)) {
+    clearTimeout(disconnectTimers.get(userSocket.id));
+    disconnectTimers.delete(userSocket.id);
   }
 
-  // Update activity on any event
+  // Notify partner and close room
+  if (userSocket.roomID) {
+    userSocket.to(userSocket.roomID).emit('partner_disconnected');
+    
+    const room = io.sockets.adapter.rooms.get(userSocket.roomID);
+    if (room) {
+      for (const id of room) {
+        const s = io.sockets.sockets.get(id);
+        if (s) { 
+          s.leave(userSocket.roomID); 
+          s.roomID = null; 
+        }
+      }
+    }
+    userSocket.roomID = null;
+  }
+};
+
+io.on('connection', (socket) => {
+  console.log(`User connected: ${socket.id}`);
+  socket.lastActive = Date.now();
+
+  // --- RECOVERY LOGIC ---
+  if (socket.recovered) {
+    console.log(`User ${socket.id} recovered session`);
+    // If they had a pending disconnect timer, CANCEL IT. They are back!
+    if (disconnectTimers.has(socket.id)) {
+      clearTimeout(disconnectTimers.get(socket.id));
+      disconnectTimers.delete(socket.id);
+    }
+    // Tell the partner we are back
+    if (socket.roomID) {
+      socket.to(socket.roomID).emit('partner_connected'); 
+    }
+  }
+
   socket.onAny(() => {
     socket.lastActive = Date.now();
   });
 
   socket.on('find_partner', (userData) => {
     socket.userData = userData; 
-    socket.lastActive = Date.now();
+    
+    // Clear any existing disconnect timers just in case
+    if (disconnectTimers.has(socket.id)) {
+      clearTimeout(disconnectTimers.get(socket.id));
+      disconnectTimers.delete(socket.id);
+    }
 
     const isGenericField = userData.field === '' || userData.field === 'Others';
 
@@ -127,13 +167,11 @@ io.on('connection', (socket) => {
       }
 
       // 3. QUEUE USER
-      const queueItem = {
+      waitingQueue.push({
         socket: socket,
         userData: userData,
         openToAny: false 
-      };
-      
-      waitingQueue.push(queueItem);
+      });
 
       // DELAY 2 Config
       const priorityWaitTime = isGenericField ? 4000 : 3000;
@@ -164,7 +202,6 @@ io.on('connection', (socket) => {
       socket.to(socket.roomID).emit('receive_message', {
         text: messageData.text,
         type: 'stranger',
-        // PASS THE REPLY DATA THROUGH
         replyTo: messageData.replyTo 
       });
     }
@@ -176,30 +213,31 @@ io.on('connection', (socket) => {
     }
   });
 
-  const handleDisconnect = (userSocket) => {
-    waitingQueue = waitingQueue.filter(s => s.socket.id !== userSocket.id);
-
-    if (userSocket.roomID) {
-      userSocket.to(userSocket.roomID).emit('partner_disconnected');
-      
-      const room = io.sockets.adapter.rooms.get(userSocket.roomID);
-      if (room) {
-        for (const id of room) {
-          const s = io.sockets.sockets.get(id);
-          if (s) { s.leave(userSocket.roomID); s.roomID = null; }
-        }
-      }
-      userSocket.roomID = null;
-    }
-  };
-
+  // User manually clicked "Next" / "Disconnect"
   socket.on('disconnect_partner', () => {
-    handleDisconnect(socket);
+    performDisconnect(socket);
   });
 
+  // Internet dropped or Tab closed
   socket.on('disconnect', (reason) => {
     console.log(`User ${socket.id} disconnected. Reason: ${reason}`);
-    handleDisconnect(socket);
+    
+    // If they are in a queue, remove them immediately
+    waitingQueue = waitingQueue.filter(s => s.socket.id !== socket.id);
+
+    // If they are in a chat, START GRACE TIMER
+    if (socket.roomID) {
+      // Notify partner that user is "Away/Reconnecting"
+      socket.to(socket.roomID).emit('partner_reconnecting_server');
+
+      // Wait 60 seconds (1 min) before actually killing the session
+      const timer = setTimeout(() => {
+        console.log(`Grace period over for ${socket.id}, killing session.`);
+        performDisconnect(socket);
+      }, RECONNECT_GRACE_PERIOD);
+
+      disconnectTimers.set(socket.id, timer);
+    }
   });
 });
 
