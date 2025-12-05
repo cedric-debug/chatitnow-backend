@@ -17,17 +17,13 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 3001;
 
 const io = new Server(server, {
-  // --- MOBILE STABILITY FIX START ---
+  // --- MOBILE STABILITY FIX ---
   connectionStateRecovery: {
-    // Allow recovery for up to 10 minutes
     maxDisconnectionDuration: 10 * 60 * 1000,
     skipMiddlewares: true,
   },
-  // CRITICAL: Wait 10 MINUTES (600,000ms) before considering a user "dead"
-  // This allows users to switch apps for a long time without disconnecting
   pingTimeout: 600000, 
   pingInterval: 25000,
-  // --- MOBILE STABILITY FIX END ---
   
   cors: {
     origin: [
@@ -68,7 +64,6 @@ const matchUsers = (socket1, socket2) => {
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
 
-  // If the connection was recovered (user came back), restore data
   if (socket.recovered) {
     console.log(`User ${socket.id} recovered connection`);
   }
@@ -76,23 +71,31 @@ io.on('connection', (socket) => {
   socket.on('find_partner', (userData) => {
     socket.userData = userData; 
 
-    // DELAY 1: Wait 3 seconds
+    // Check if the user provided a specific field or if it's generic
+    const isGenericField = userData.field === '' || userData.field === 'Others';
+
+    // DELAY 1: Wait 3 seconds (Ad view time)
     setTimeout(() => {
       if (!socket.connected) return;
 
-      // 1. Priority Match
-      const exactMatch = waitingQueue.find(user => 
-        user.socket.id !== socket.id &&
-        user.userData.field !== '' &&
-        user.userData.field === userData.field
-      );
+      // --- MATCHING LOGIC START ---
 
-      if (exactMatch) {
-        matchUsers(socket, exactMatch.socket);
-        return;
+      // 1. PRIORITY MATCH: Only if the user has a SPECIFIC field
+      if (!isGenericField) {
+        const exactMatch = waitingQueue.find(user => 
+          user.socket.id !== socket.id &&
+          user.userData.field !== '' &&
+          user.userData.field !== 'Others' && 
+          user.userData.field === userData.field
+        );
+
+        if (exactMatch) {
+          matchUsers(socket, exactMatch.socket);
+          return;
+        }
       }
 
-      // 2. Desperation Match
+      // 2. DESPERATION CHECK: Look for someone who has been waiting too long
       const desperateUser = waitingQueue.find(user => 
         user.socket.id !== socket.id &&
         user.openToAny === true
@@ -103,30 +106,50 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // 3. Queue User
+      // 3. QUEUE USER
       const queueItem = {
         socket: socket,
         userData: userData,
         openToAny: false 
       };
+      
       waitingQueue.push(queueItem);
 
-      // DELAY 2: Wait 7 seconds then open to random
+      // --- DELAY 2: QUEUE WAIT TIMES ---
+      
+      // Config: 
+      // Specific Field = 3s Priority + 2s Random Buffer = 5s Total
+      // Generic Field  = 4s Wait -> Random
+      
+      const priorityWaitTime = isGenericField ? 4000 : 3000;
+
       setTimeout(() => {
-        // Check if socket is still valid and in queue
-        if (!socket.connected) return;
-
+        // Check if user is still connected and still in queue
         const currentEntry = waitingQueue.find(u => u.socket.id === socket.id);
+        
         if (currentEntry) {
+          // Phase 2: Mark as Open To Any
           currentEntry.openToAny = true; 
-          const anyMatch = waitingQueue.find(u => u.socket.id !== socket.id);
-          if (anyMatch) {
-            matchUsers(socket, anyMatch.socket);
-          }
-        }
-      }, 7000); 
+          
+          // If it was a Specific Field, we add an extra 2s buffer before forcing a random match
+          // giving a slight chance for another specific match to come in last second.
+          const extraBuffer = isGenericField ? 0 : 2000;
 
-    }, 3000); 
+          setTimeout(() => {
+             // Final Check
+             const finalEntry = waitingQueue.find(u => u.socket.id === socket.id);
+             if (finalEntry) {
+                // Scan for ANY available user
+                const anyMatch = waitingQueue.find(u => u.socket.id !== socket.id);
+                if (anyMatch) {
+                  matchUsers(socket, anyMatch.socket);
+                }
+             }
+          }, extraBuffer);
+        }
+      }, priorityWaitTime); 
+
+    }, 3000); // Initial 3s Ad Delay
   });
 
   socket.on('send_message', (messageData) => {
@@ -144,12 +167,9 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- DISCONNECT HANDLER (The "Cleaner") ---
-  const performDisconnect = (userSocket) => {
-    // 1. Remove from queue immediately
+  const handleDisconnect = (userSocket) => {
     waitingQueue = waitingQueue.filter(s => s.socket.id !== userSocket.id);
 
-    // 2. If in a room, notify partner
     if (userSocket.roomID) {
       userSocket.to(userSocket.roomID).emit('partner_disconnected');
       
@@ -164,16 +184,13 @@ io.on('connection', (socket) => {
     }
   };
 
-  // 1. MANUAL DISCONNECT (User clicked "Next" or "End")
   socket.on('disconnect_partner', () => {
-    performDisconnect(socket);
+    handleDisconnect(socket);
   });
 
-  // 2. AUTO DISCONNECT
-  // Only fires after 10 MINUTES of no contact
   socket.on('disconnect', (reason) => {
     console.log(`User ${socket.id} disconnected. Reason: ${reason}`);
-    performDisconnect(socket);
+    handleDisconnect(socket);
   });
 });
 
