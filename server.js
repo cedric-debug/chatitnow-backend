@@ -26,7 +26,7 @@ const io = new Server(server, {
   pingTimeout: 60000, 
   pingInterval: 25000,
   cors: {
-    origin: "*", // Allow all origins for easier debugging, restrict in production
+    origin: "*", // Allow all origins
     methods: ["GET", "POST"]
   }
 });
@@ -46,6 +46,13 @@ setInterval(() => {
   });
 }, 60 * 1000);
 
+// --- HELPER FUNCTIONS ---
+
+// FIX: Added the missing helper function here
+const removeFromQueue = (sessionID) => {
+  waitingQueue = waitingQueue.filter(u => u.sessionID !== sessionID);
+};
+
 const matchUsers = (socket1, socket2) => {
   // Check if sockets are still connected/valid
   if (!socket1 || !socket2) return;
@@ -62,8 +69,9 @@ const matchUsers = (socket1, socket2) => {
   if (socket1.sessionID && sessionMap.has(socket1.sessionID)) sessionMap.get(socket1.sessionID).roomID = roomID;
   if (socket2.sessionID && sessionMap.has(socket2.sessionID)) sessionMap.get(socket2.sessionID).roomID = roomID;
 
-  // Remove both from queue
-  waitingQueue = waitingQueue.filter(u => u.sessionID !== socket1.sessionID && u.sessionID !== socket2.sessionID);
+  // Remove both from queue using sessionID
+  removeFromQueue(socket1.sessionID);
+  removeFromQueue(socket2.sessionID);
 
   io.to(socket1.id).emit('matched', {
     name: socket2.userData.username,
@@ -96,9 +104,11 @@ const cleanupSession = (sessionID) => {
   }
   
   // Remove from queue if they were waiting
-  waitingQueue = waitingQueue.filter(u => u.sessionID !== sessionID);
+  removeFromQueue(sessionID);
   sessionMap.delete(sessionID);
 };
+
+// --- SOCKET LOGIC ---
 
 io.on('connection', (socket) => {
   const sessionID = socket.handshake.auth.sessionID;
@@ -137,8 +147,6 @@ io.on('connection', (socket) => {
       socket.join(session.roomID);
       // Tell partner we are back
       socket.to(session.roomID).emit('partner_connected');
-      // Tell myself I am back (optional state sync)
-      socket.emit('rejoined_room', { name: 'Partner', status: 'connected' }); 
     } 
     
     // 2. IF IN QUEUE: Update the socket reference in the queue
@@ -195,7 +203,6 @@ io.on('connection', (socket) => {
         }
 
         // 2. Any Match (if user is openToAny or desperate)
-        // Simplified: Just match with the longest waiting user
         if (potentialMatches.length > 0) {
              const anyMatch = potentialMatches[0];
              matchUsers(socket, anyMatch.socket);
@@ -223,7 +230,7 @@ io.on('connection', (socket) => {
         text: messageData.text,
         type: 'stranger',
         replyTo: messageData.replyTo,
-        timestamp: messageData.timestamp // Pass timestamp if sent from client
+        timestamp: messageData.timestamp
       });
     }
   });
@@ -244,9 +251,8 @@ io.on('connection', (socket) => {
     if (sessionMap.has(socket.sessionID)) {
       const session = sessionMap.get(socket.sessionID);
       
-      // If user was just in queue, remove them immediately (no grace period needed for queue usually)
-      // But if you want queue persistence, keep them. Here we remove to prevent ghost matches.
-      waitingQueue = waitingQueue.filter(u => u.sessionID !== socket.sessionID);
+      // Remove from waiting queue if they were just searching
+      removeFromQueue(socket.sessionID);
 
       if (session.roomID) {
         // Notify partner of temporary disconnect
