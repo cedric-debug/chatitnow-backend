@@ -16,13 +16,17 @@ const server = http.createServer(app);
 // Cloud port configuration
 const PORT = process.env.PORT || 3001;
 
+// 10 Minutes in milliseconds
+const INACTIVITY_LIMIT = 10 * 60 * 1000; 
+
 const io = new Server(server, {
-  // --- MOBILE STABILITY FIX ---
+  // This helps mobile stay connected if signal drops
   connectionStateRecovery: {
-    maxDisconnectionDuration: 10 * 60 * 1000,
+    maxDisconnectionDuration: INACTIVITY_LIMIT,
     skipMiddlewares: true,
   },
-  pingTimeout: 600000, 
+  // This kills dead connections (network loss)
+  pingTimeout: INACTIVITY_LIMIT, 
   pingInterval: 25000,
   
   cors: {
@@ -38,6 +42,18 @@ const io = new Server(server, {
 
 let waitingQueue = [];
 
+// --- IDLE CHECKER (Applies to Desktop & Mobile) ---
+// This ensures users are kicked if they are truly idle (not typing/interacting)
+setInterval(() => {
+  const now = Date.now();
+  io.sockets.sockets.forEach((socket) => {
+    if (socket.lastActive && (now - socket.lastActive > INACTIVITY_LIMIT)) {
+      console.log(`Disconnecting inactive user: ${socket.id}`);
+      socket.disconnect(true);
+    }
+  });
+}, 60 * 1000); // Check every minute
+
 const matchUsers = (socket1, socket2) => {
   const roomID = `${socket1.id}#${socket2.id}`;
   socket1.join(roomID);
@@ -45,7 +61,6 @@ const matchUsers = (socket1, socket2) => {
   socket1.roomID = roomID;
   socket2.roomID = roomID;
 
-  // Remove both from queue
   waitingQueue = waitingQueue.filter(u => u.socket.id !== socket1.id && u.socket.id !== socket2.id);
 
   io.to(socket1.id).emit('matched', {
@@ -63,24 +78,29 @@ const matchUsers = (socket1, socket2) => {
 
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
+  
+  // Track activity
+  socket.lastActive = Date.now();
 
   if (socket.recovered) {
     console.log(`User ${socket.id} recovered connection`);
   }
 
+  // Update activity on any event
+  socket.onAny(() => {
+    socket.lastActive = Date.now();
+  });
+
   socket.on('find_partner', (userData) => {
     socket.userData = userData; 
+    socket.lastActive = Date.now();
 
-    // Check if the user provided a specific field or if it's generic
     const isGenericField = userData.field === '' || userData.field === 'Others';
 
-    // DELAY 1: Wait 3 seconds (Ad view time)
     setTimeout(() => {
       if (!socket.connected) return;
 
-      // --- MATCHING LOGIC START ---
-
-      // 1. PRIORITY MATCH: Only if the user has a SPECIFIC field
+      // 1. PRIORITY MATCH
       if (!isGenericField) {
         const exactMatch = waitingQueue.find(user => 
           user.socket.id !== socket.id &&
@@ -95,7 +115,7 @@ io.on('connection', (socket) => {
         }
       }
 
-      // 2. DESPERATION CHECK: Look for someone who has been waiting too long
+      // 2. DESPERATION CHECK
       const desperateUser = waitingQueue.find(user => 
         user.socket.id !== socket.id &&
         user.openToAny === true
@@ -115,31 +135,18 @@ io.on('connection', (socket) => {
       
       waitingQueue.push(queueItem);
 
-      // --- DELAY 2: QUEUE WAIT TIMES ---
-      
-      // Config: 
-      // Specific Field = 3s Priority + 2s Random Buffer = 5s Total
-      // Generic Field  = 4s Wait -> Random
-      
+      // DELAY 2 Config
       const priorityWaitTime = isGenericField ? 4000 : 3000;
 
       setTimeout(() => {
-        // Check if user is still connected and still in queue
         const currentEntry = waitingQueue.find(u => u.socket.id === socket.id);
-        
         if (currentEntry) {
-          // Phase 2: Mark as Open To Any
           currentEntry.openToAny = true; 
-          
-          // If it was a Specific Field, we add an extra 2s buffer before forcing a random match
-          // giving a slight chance for another specific match to come in last second.
           const extraBuffer = isGenericField ? 0 : 2000;
 
           setTimeout(() => {
-             // Final Check
              const finalEntry = waitingQueue.find(u => u.socket.id === socket.id);
              if (finalEntry) {
-                // Scan for ANY available user
                 const anyMatch = waitingQueue.find(u => u.socket.id !== socket.id);
                 if (anyMatch) {
                   matchUsers(socket, anyMatch.socket);
@@ -149,7 +156,7 @@ io.on('connection', (socket) => {
         }
       }, priorityWaitTime); 
 
-    }, 3000); // Initial 3s Ad Delay
+    }, 3000); 
   });
 
   socket.on('send_message', (messageData) => {
