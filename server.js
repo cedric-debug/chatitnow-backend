@@ -6,6 +6,7 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
+// Health Check
 app.get("/", (req, res) => {
   res.send("ChatItNow Server is Running!");
 });
@@ -38,15 +39,15 @@ const sessionMap = new Map();
 
 // --- HELPER FUNCTIONS ---
 
-function removeFromQueue(sessionID) {
-  waitingQueue = waitingQueue.filter(u => u.sessionID !== sessionID);
-}
-
-// Helper to get the LIVE socket object from a session ID
+// 1. Get the LIVE socket object from a session ID (Critical for the fix)
 function getSocketFromSession(sessionID) {
   const session = sessionMap.get(sessionID);
   if (!session || !session.socketId) return null;
   return io.sockets.sockets.get(session.socketId);
+}
+
+function removeFromQueue(sessionID) {
+  waitingQueue = waitingQueue.filter(u => u.sessionID !== sessionID);
 }
 
 function cleanupSession(sessionID) {
@@ -58,6 +59,7 @@ function cleanupSession(sessionID) {
   // Notify partner
   if (session.roomID) {
     io.to(session.roomID).emit('partner_disconnected');
+    // Clear room
     io.in(session.roomID).socketsLeave(session.roomID);
   }
   
@@ -65,15 +67,23 @@ function cleanupSession(sessionID) {
   sessionMap.delete(sessionID);
 }
 
+// 2. Execute Match using Session IDs (not raw sockets)
 function executeMatch(sessionID1, sessionID2) {
   const socket1 = getSocketFromSession(sessionID1);
   const socket2 = getSocketFromSession(sessionID2);
 
-  // If either socket is gone (disconnected during the wait), abort match
-  // and put the survivor back in queue or cleanup
+  // If one of them disconnected completely during the wait, abort
   if (!socket1 || !socket2) {
-    if (socket1) removeFromQueue(sessionID1); // Reset state
-    if (socket2) removeFromQueue(sessionID2);
+    // If one is still alive, put them back in queue or let them retry
+    if (socket1) {
+       // Reset their match status so they can be picked up again
+       const entry = waitingQueue.find(u => u.sessionID === sessionID1);
+       if (entry) entry.isMatched = false; 
+    }
+    if (socket2) {
+       const entry = waitingQueue.find(u => u.sessionID === sessionID2);
+       if (entry) entry.isMatched = false;
+    }
     return;
   }
 
@@ -139,12 +149,8 @@ io.on('connection', (socket) => {
   if (sessionMap.has(sessionID)) {
     const session = sessionMap.get(sessionID);
     
-    // Update live socket ID in the map
+    // Update live socket ID in the map immediately
     session.socketId = socket.id;
-
-    // Restore data
-    socket.userData = session.userData;
-    socket.roomID = session.roomID;
 
     // Stop disconnect timer if active
     if (session.timer) {
@@ -153,13 +159,18 @@ io.on('connection', (socket) => {
       session.timer = null;
     }
 
-    // Rejoin Room logic
+    // Restore data to the new socket object
+    socket.userData = session.userData;
+    socket.roomID = session.roomID;
+
+    // If they were in a room, rejoin it
     if (session.roomID) {
       socket.join(session.roomID);
       socket.to(session.roomID).emit('partner_connected'); 
       socket.emit('session_restored', { status: 'connected' });
     } 
-    // Note: We don't need to update waitingQueue because it stores sessionID, which hasn't changed.
+    // If they were in the queue, we don't need to do anything because
+    // executeMatch() looks up the socket dynamically via getSocketFromSession()
 
   } else {
     // New Session
@@ -175,18 +186,20 @@ io.on('connection', (socket) => {
     socket.lastActive = Date.now();
   });
 
-  // --- SEARCH LOGIC (AD DELAY + PRIORITY) ---
+  // --- SEARCH LOGIC ---
   socket.on('find_partner', (userData) => {
     socket.userData = userData;
+    // Update session data store
     if (sessionMap.has(socket.sessionID)) {
       sessionMap.get(socket.sessionID).userData = userData;
     }
 
-    // 1. Remove from queue if already there (reset search)
+    // Reset Queue state: remove existing entry to avoid duplicates
     removeFromQueue(socket.sessionID);
 
-    // 2. Add to Queue immediately
-    // openToAny is initially false (Priority Mode)
+    const isGenericField = userData.field === '' || userData.field === 'Others';
+
+    // 1. Add to Queue immediately (Store DATA, not SOCKET)
     const myEntry = { 
       sessionID: socket.sessionID, 
       userData: userData, 
@@ -196,16 +209,15 @@ io.on('connection', (socket) => {
     };
     waitingQueue.push(myEntry);
 
-    const isGenericField = userData.field === '' || userData.field === 'Others';
-
-    // 3. START 3-SECOND AD TIMER
+    // 2. START 3-SECOND AD TIMER
     setTimeout(() => {
-      // Check if user is still connected and still looking
+      // Re-fetch entry to see if it's still valid
       const currentEntry = waitingQueue.find(u => u.sessionID === socket.sessionID);
+      
+      // If user left queue or already got matched, stop.
       if (!currentEntry || currentEntry.isMatched) return;
 
       // --- MATCHING ATTEMPT AFTER 3s ---
-      
       const candidates = waitingQueue.filter(u => u.sessionID !== socket.sessionID && !u.isMatched);
       
       // A. Priority Match (Same Field)
@@ -228,12 +240,9 @@ io.on('connection', (socket) => {
       currentEntry.openToAny = true;
 
       // C. Find any available partner
-      // We match if: 
-      // 1. They are also "Open" (Desperate)
-      // 2. OR if I match THEIR priority field
       const anyMatch = candidates.find(u => {
-        if (u.openToAny) return true; // They will take anyone
-        return u.userData.field === userData.field; // I fit their preference
+        if (u.openToAny) return true; // They are desperate too
+        return u.userData.field === userData.field; // I fit their priority
       });
 
       if (anyMatch) {
@@ -246,11 +255,12 @@ io.on('connection', (socket) => {
   });
 
   socket.on('send_message', (messageData) => {
-    // Robust Send: Lookup via Session
+    // Robust Send: Always look up room via Session Map
     const session = sessionMap.get(socket.sessionID);
     const currentRoomID = session ? session.roomID : null;
 
     if (currentRoomID) {
+      // Self-healing: Join room if missing
       if (!socket.rooms.has(currentRoomID)) {
         socket.join(currentRoomID);
       }
@@ -282,7 +292,7 @@ io.on('connection', (socket) => {
     if (sessionMap.has(socket.sessionID)) {
       const session = sessionMap.get(socket.sessionID);
       
-      // If user was just in queue, remove immediately
+      // If waiting in queue, remove immediately
       removeFromQueue(socket.sessionID);
 
       if (session.roomID) {
