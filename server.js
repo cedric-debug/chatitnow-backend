@@ -19,8 +19,8 @@ const INACTIVITY_LIMIT = 10 * 60 * 1000; // 10 Minutes
 const RECONNECT_GRACE_PERIOD = 3 * 60 * 1000; // 3 Minutes
 
 // --- TIMING CONFIG ---
-const PHASE_1_DELAY = 3000; // Wait 3s for Ad/Same Field
-const PHASE_2_DELAY = 2000; // Wait additional 2s for Random
+const PHASE_1_DELAY = 3000; // Wait 3s for Ad/Same Field match
+const PHASE_2_DELAY = 2000; // Wait additional 2s before accepting Random match
 
 const io = new Server(server, {
   connectionStateRecovery: {
@@ -58,8 +58,8 @@ function cleanupSession(sessionID) {
   
   if (session.timer) clearTimeout(session.timer);
   
-  // Notify partner
   if (session.roomID) {
+    // Notify partner
     io.to(session.roomID).emit('partner_disconnected');
     io.in(session.roomID).socketsLeave(session.roomID);
   }
@@ -75,7 +75,6 @@ function executeMatch(sessionID1, sessionID2) {
   // If one disconnected during the wait
   if (!socket1 || !socket2) {
     if (socket1) {
-       // Reset match flag so they can be picked up by someone else
        const entry = waitingQueue.find(u => u.sessionID === sessionID1);
        if (entry) entry.isMatched = false; 
     }
@@ -145,25 +144,33 @@ io.on('connection', (socket) => {
   if (sessionMap.has(sessionID)) {
     const session = sessionMap.get(sessionID);
     
+    // Update live socket ID
     session.socketId = socket.id;
+
+    // Restore data
     socket.userData = session.userData;
     socket.roomID = session.roomID;
 
+    // Stop disconnect timer
     if (session.timer) {
+      console.log(`Restored session: ${sessionID}`);
       clearTimeout(session.timer);
       session.timer = null;
     }
 
+    // Rejoin Room
     if (session.roomID) {
       socket.join(session.roomID);
       socket.to(session.roomID).emit('partner_connected'); 
       socket.emit('session_restored', { status: 'connected' });
     } else {
+      // If queueing, update socket ref
       const queueItem = waitingQueue.find(q => q.sessionID === sessionID);
       if (queueItem) queueItem.socket = socket;
     }
 
   } else {
+    // New Session
     sessionMap.set(sessionID, { 
       socketId: socket.id, 
       roomID: null, 
@@ -176,15 +183,16 @@ io.on('connection', (socket) => {
     socket.lastActive = Date.now();
   });
 
-  // --- SEARCH LOGIC (3s Priority -> 2s Wait -> Any) ---
+  // --- SEARCH LOGIC (FIXED: Hard Reset + 3s Wait + 2s Wait) ---
   socket.on('find_partner', (userData) => {
     socket.userData = userData;
-
+    
     // 1. HARD RESET: Clear previous room data from session
     if (sessionMap.has(socket.sessionID)) {
       const session = sessionMap.get(socket.sessionID);
-      session.userData = userData; // Update preference
+      session.userData = userData; 
       
+      // Leave old room
       if (session.roomID) {
         socket.leave(session.roomID);
         session.roomID = null;
@@ -209,7 +217,7 @@ io.on('connection', (socket) => {
 
     // --- PHASE 1: Wait 3 Seconds (Ad View) ---
     setTimeout(() => {
-      // Valid check
+      // Check if user is still in queue
       const currentEntry = waitingQueue.find(u => u.sessionID === socket.sessionID);
       if (!currentEntry || currentEntry.isMatched) return;
 
@@ -227,13 +235,13 @@ io.on('connection', (socket) => {
           currentEntry.isMatched = true;
           exactMatch.isMatched = true;
           executeMatch(socket.sessionID, exactMatch.sessionID);
-          return; // Match found, stop here.
+          return;
         }
       }
 
       // --- PHASE 2: Wait Additional 2 Seconds ---
       setTimeout(() => {
-        // Valid check again
+        // Check validity again
         const reCheckEntry = waitingQueue.find(u => u.sessionID === socket.sessionID);
         if (!reCheckEntry || reCheckEntry.isMatched) return;
 
@@ -241,14 +249,11 @@ io.on('connection', (socket) => {
         reCheckEntry.openToAny = true;
 
         // Try Any Match
-        // We match if:
-        // 1. They are also Open (Desperate)
-        // 2. OR I match THEIR priority field (I am their perfect match)
         const openCandidates = waitingQueue.filter(u => u.sessionID !== socket.sessionID && !u.isMatched);
         
         const anyMatch = openCandidates.find(u => {
           if (u.openToAny) return true; // They match anyone
-          return u.userData.field === userData.field; // I match them
+          return u.userData.field === userData.field; // I match their priority
         });
 
         if (anyMatch) {
@@ -286,7 +291,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- MANUAL DISCONNECT ---
+  // --- MANUAL DISCONNECT (FIXED: notify ONLY partner) ---
   socket.on('disconnect_partner', () => {
     const session = sessionMap.get(socket.sessionID);
     if (session && session.roomID) {
@@ -300,17 +305,27 @@ io.on('connection', (socket) => {
     removeFromQueue(socket.sessionID);
   });
 
+  // --- SOCKET DISCONNECT (FIXED: Stale Check + Grace Period) ---
   socket.on('disconnect', (reason) => {
-    console.log(`Disconnected: ${socket.id}`);
+    console.log(`Disconnected: ${socket.id} (${reason})`);
 
     if (sessionMap.has(socket.sessionID)) {
       const session = sessionMap.get(socket.sessionID);
+
+      // STALE CHECK: If the socket ID in session is different, 
+      // it means the user already reconnected on a new socket. Ignore this disconnect.
+      if (session.socketId !== socket.id) {
+        console.log(`Ignored stale disconnect for session ${socket.sessionID}`);
+        return;
+      }
       
       removeFromQueue(socket.sessionID);
 
       if (session.roomID) {
+        // Notify partner
         socket.to(session.roomID).emit('partner_reconnecting_server');
         
+        // Start 3 min grace timer
         session.timer = setTimeout(() => {
           console.log(`Session expired: ${socket.sessionID}`);
           cleanupSession(socket.sessionID);
