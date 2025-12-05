@@ -14,19 +14,28 @@ app.get("/", (req, res) => {
 const server = http.createServer(app);
 const PORT = process.env.PORT || 3001;
 
-// --- CONFIGURATION ---
-const INACTIVITY_LIMIT = 10 * 60 * 1000; // 10 Minutes
-const RECONNECT_GRACE_PERIOD = 3 * 60 * 1000; // 3 Minutes
+// --- CONFIGURATION UPDATED ---
+// 1. INACTIVITY_LIMIT: How long can they stay silent before we kick them? 
+// SET TO: 24 Hours ( effectively "never" unless they stay open for a day)
+const INACTIVITY_LIMIT = 24 * 60 * 60 * 1000; 
 
-// --- TIMING CONFIG ---
-const PHASE_1_DELAY = 3000; // Wait 3s for Ad/Same Field
-const PHASE_2_DELAY = 2000; // Wait additional 2s for Random
+// 2. RECONNECT_GRACE_PERIOD: How long do we wait if they close the app/tab?
+// SET TO: 24 Hours (Session stays alive waiting for them to reopen the app)
+const RECONNECT_GRACE_PERIOD = 24 * 60 * 60 * 1000; 
+
+// 3. AD DELAY: 3 Seconds mandatory wait
+const AD_DELAY_MS = 3000; 
+
+// 4. PRIORITY WAIT: 2 Seconds additional wait
+const PHASE_2_DELAY = 2000;
 
 const io = new Server(server, {
   connectionStateRecovery: {
     maxDisconnectionDuration: 2 * 60 * 1000,
     skipMiddlewares: true,
   },
+  // Keep ping settings standard to detect network drops quickly
+  // so we can switch them to "Reconnecting" status on the partner's screen
   pingTimeout: 60000, 
   pingInterval: 25000,
   cors: {
@@ -127,15 +136,17 @@ function executeMatch(sessionID1, sessionID2) {
   });
 }
 
-// --- IDLE CHECKER ---
+// --- IDLE CHECKER (Modified to be lenient) ---
 setInterval(() => {
   const now = Date.now();
   io.sockets.sockets.forEach((socket) => {
-    if (socket.lastActive && (now - socket.lastActive > INACTIVITY_LIMIT)) {
+    // Only disconnect if they are connected AND exceeded the 24 hour limit
+    if (socket.connected && socket.lastActive && (now - socket.lastActive > INACTIVITY_LIMIT)) {
+      console.log(`Force disconnecting idle socket: ${socket.id}`);
       socket.disconnect(true);
     }
   });
-}, 60 * 1000);
+}, 60 * 1000); // Check every minute
 
 
 // --- MAIN CONNECTION LOGIC ---
@@ -152,7 +163,7 @@ io.on('connection', (socket) => {
 
   console.log(`Connected: ${socket.id}`);
 
-  // --- RECONNECTION HANDLER ---
+  // --- RECONNECTION HANDLER (Stale Check + Session Restore) ---
   if (sessionMap.has(sessionID)) {
     const session = sessionMap.get(sessionID);
     
@@ -161,8 +172,10 @@ io.on('connection', (socket) => {
     socket.userData = session.userData;
     socket.roomID = session.roomID;
 
+    // [FEATURE: Stale Connection Check]
+    // Cancel the "Death Timer" because they came back
     if (session.timer) {
-      console.log(`Restored session: ${sessionID}`);
+      console.log(`Restored session: ${sessionID} (Timer cancelled)`);
       clearTimeout(session.timer);
       session.timer = null;
     }
@@ -181,6 +194,7 @@ io.on('connection', (socket) => {
         session.messageQueue = [];
       }
     } else {
+      // If they were waiting, update queue reference
       const queueItem = waitingQueue.find(q => q.sessionID === sessionID);
       if (queueItem) queueItem.socket = socket;
     }
@@ -208,13 +222,13 @@ io.on('connection', (socket) => {
     // [FEATURE: Hard Reset]
     if (sessionMap.has(socket.sessionID)) {
       const session = sessionMap.get(socket.sessionID);
+      session.userData = userData;
       if (session.roomID) {
         socket.leave(session.roomID);
         session.roomID = null;
       }
       session.partnerSessionID = null;
       session.messageQueue = [];
-      session.userData = userData;
     }
 
     removeFromQueue(socket.sessionID);
@@ -274,9 +288,9 @@ io.on('connection', (socket) => {
           executeMatch(socket.sessionID, anyMatch.sessionID);
         }
 
-      }, PHASE_2_DELAY); // +2 Seconds
+      }, PHASE_2_DELAY);
 
-    }, PHASE_1_DELAY); // +3 Seconds (Total 5s for random match)
+    }, AD_DELAY_MS);
   });
 
   socket.on('send_message', (messageData) => {
@@ -299,9 +313,7 @@ io.on('connection', (socket) => {
     if (partnerSession && partnerSession.socketId) {
       const partnerSocket = io.sockets.sockets.get(partnerSession.socketId);
       
-      // If partner is ONLINE
       if (partnerSocket && partnerSocket.connected) {
-        // Force join if missing (Safety net)
         if (!socket.rooms.has(session.roomID)) socket.join(session.roomID);
         
         socket.to(session.roomID).emit('receive_message', msgPayload);
@@ -328,9 +340,7 @@ io.on('connection', (socket) => {
   socket.on('disconnect_partner', () => {
     const session = sessionMap.get(socket.sessionID);
     if (session && session.roomID) {
-      // Notify ONLY the partner
       socket.to(session.roomID).emit('partner_disconnected');
-      
       io.in(session.roomID).socketsLeave(session.roomID);
       session.roomID = null;
       session.partnerSessionID = null;
@@ -339,28 +349,31 @@ io.on('connection', (socket) => {
     removeFromQueue(socket.sessionID);
   });
 
+  // [FEATURE: Infinite Session Persistence (until 24h)]
   socket.on('disconnect', (reason) => {
-    console.log(`Disconnected: ${socket.id}`);
+    console.log(`Disconnected: ${socket.id} (${reason})`);
 
     if (sessionMap.has(socket.sessionID)) {
       const session = sessionMap.get(socket.sessionID);
 
-      // [FEATURE: Stale Connection Check]
-      if (session.socketId !== socket.id) {
-        return; // Ignore disconnect if user already reconnected on new socket
-      }
+      // Stale Check: Did they already reconnect elsewhere?
+      if (session.socketId !== socket.id) return;
       
       removeFromQueue(socket.sessionID);
 
       if (session.roomID) {
+        // Tell partner "Reconnecting..."
         socket.to(session.roomID).emit('partner_reconnecting_server');
         
+        // Start 24 Hour Timer before actually killing the session
         session.timer = setTimeout(() => {
-          console.log(`Session expired: ${socket.sessionID}`);
+          console.log(`24h Grace period expired for ${socket.sessionID}`);
           cleanupSession(socket.sessionID);
         }, RECONNECT_GRACE_PERIOD);
       } else {
-        sessionMap.delete(socket.sessionID);
+        // If not in a room, we can keep the session ID valid for reconnection
+        // but we don't need a timer because there's no chat state to preserve.
+        // We leave it in sessionMap until the next server restart or manual cleanup.
       }
     }
   });
