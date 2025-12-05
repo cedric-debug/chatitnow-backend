@@ -16,7 +16,7 @@ const PORT = process.env.PORT || 3001;
 
 // --- CONFIGURATION ---
 const INACTIVITY_LIMIT = 10 * 60 * 1000; // 10 Minutes
-const RECONNECT_GRACE_PERIOD = 3 * 60 * 1000; // 3 Minutes (UPDATED)
+const RECONNECT_GRACE_PERIOD = 3 * 60 * 1000; // 3 Minutes
 
 // --- SOCKET SERVER SETUP ---
 const io = new Server(server, {
@@ -39,18 +39,15 @@ const sessionMap = new Map();
 
 // --- HELPER FUNCTIONS ---
 
-// 1. Remove user from queue
 function removeFromQueue(sessionID) {
   waitingQueue = waitingQueue.filter(u => u.sessionID !== sessionID);
 }
 
-// 2. Clean up a session (End chat fully)
 function cleanupSession(sessionID) {
   if (!sessionMap.has(sessionID)) return;
   
   const session = sessionMap.get(sessionID);
   
-  // Stop grace period timer
   if (session.timer) clearTimeout(session.timer);
   
   // Notify partner
@@ -68,7 +65,6 @@ function cleanupSession(sessionID) {
   sessionMap.delete(sessionID);
 }
 
-// 3. Match two users
 function matchUsers(socket1, socket2) {
   if (!socket1 || !socket2) return;
 
@@ -80,7 +76,7 @@ function matchUsers(socket1, socket2) {
   socket1.roomID = roomID;
   socket2.roomID = roomID;
 
-  // Update session map with room info
+  // Update session map
   if (socket1.sessionID && sessionMap.has(socket1.sessionID)) {
     sessionMap.get(socket1.sessionID).roomID = roomID;
   }
@@ -139,7 +135,7 @@ io.on('connection', (socket) => {
   if (sessionMap.has(sessionID)) {
     const session = sessionMap.get(sessionID);
     
-    // User came back! Cancel the disconnect timer.
+    // Cancel disconnect timer
     if (session.timer) {
       console.log(`Restored session: ${sessionID}`);
       clearTimeout(session.timer);
@@ -154,7 +150,10 @@ io.on('connection', (socket) => {
     // Rejoin Room
     if (session.roomID) {
       socket.join(session.roomID);
-      socket.to(session.roomID).emit('partner_connected');
+      socket.to(session.roomID).emit('partner_connected'); // Tell partner we are back
+      
+      // CRITICAL UPDATE: Tell THIS user they are back too
+      socket.emit('session_restored', { status: 'connected' });
     } 
     
     // Update Queue Reference
@@ -256,7 +255,7 @@ io.on('connection', (socket) => {
       removeFromQueue(socket.sessionID);
 
       if (session.roomID) {
-        // If chatting, wait 3 minutes
+        // If chatting, wait 3 mins
         socket.to(session.roomID).emit('partner_reconnecting_server');
         
         session.timer = setTimeout(() => {
