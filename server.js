@@ -3,12 +3,14 @@ const http = require('http');
 const { Server } = require("socket.io");
 const cors = require('cors');
 
+console.log("Starting ChatItNow Server..."); // Startup Log 1
+
 const app = express();
 app.use(cors());
 
-// Health Check
+// Health Check - Crucial for Render
 app.get("/", (req, res) => {
-  res.send("ChatItNow Server is Running!");
+  res.status(200).send("ChatItNow Server is Running!");
 });
 
 const server = http.createServer(app);
@@ -17,7 +19,7 @@ const PORT = process.env.PORT || 3001;
 // --- CONFIGURATION ---
 const INACTIVITY_LIMIT = 10 * 60 * 1000; // 10 Minutes
 const RECONNECT_GRACE_PERIOD = 3 * 60 * 1000; // 3 Minutes
-const AD_DELAY_MS = 3000; // 3 Seconds mandatory wait for Ads
+const AD_DELAY_MS = 3000; // 3 Seconds
 
 const io = new Server(server, {
   connectionStateRecovery: {
@@ -34,32 +36,29 @@ const io = new Server(server, {
 
 // --- GLOBAL STATE ---
 let waitingQueue = []; 
-// Session Map: Key = sessionID, Value = { socketId, roomID, userData, timer }
 const sessionMap = new Map(); 
 
 // --- HELPER FUNCTIONS ---
 
-// 1. Get the LIVE socket object from a session ID (Critical for the fix)
+function removeFromQueue(sessionID) {
+  waitingQueue = waitingQueue.filter(u => u.sessionID !== sessionID);
+}
+
 function getSocketFromSession(sessionID) {
   const session = sessionMap.get(sessionID);
   if (!session || !session.socketId) return null;
   return io.sockets.sockets.get(session.socketId);
 }
 
-function removeFromQueue(sessionID) {
-  waitingQueue = waitingQueue.filter(u => u.sessionID !== sessionID);
-}
-
 function cleanupSession(sessionID) {
   if (!sessionMap.has(sessionID)) return;
   
   const session = sessionMap.get(sessionID);
+  
   if (session.timer) clearTimeout(session.timer);
   
-  // Notify partner
   if (session.roomID) {
     io.to(session.roomID).emit('partner_disconnected');
-    // Clear room
     io.in(session.roomID).socketsLeave(session.roomID);
   }
   
@@ -67,16 +66,14 @@ function cleanupSession(sessionID) {
   sessionMap.delete(sessionID);
 }
 
-// 2. Execute Match using Session IDs (not raw sockets)
 function executeMatch(sessionID1, sessionID2) {
   const socket1 = getSocketFromSession(sessionID1);
   const socket2 = getSocketFromSession(sessionID2);
 
-  // If one of them disconnected completely during the wait, abort
+  // If a user disconnected while waiting
   if (!socket1 || !socket2) {
-    // If one is still alive, put them back in queue or let them retry
+    // Reset the match flag for the survivor so they can match again
     if (socket1) {
-       // Reset their match status so they can be picked up again
        const entry = waitingQueue.find(u => u.sessionID === sessionID1);
        if (entry) entry.isMatched = false; 
     }
@@ -99,7 +96,6 @@ function executeMatch(sessionID1, sessionID2) {
   if (sessionMap.has(sessionID1)) sessionMap.get(sessionID1).roomID = roomID;
   if (sessionMap.has(sessionID2)) sessionMap.get(sessionID2).roomID = roomID;
 
-  // Remove from queue
   removeFromQueue(sessionID1);
   removeFromQueue(sessionID2);
 
@@ -135,7 +131,6 @@ io.on('connection', (socket) => {
   const sessionID = socket.handshake.auth.sessionID;
   
   if (!sessionID) {
-    console.log(`Rejected connection ${socket.id} (No Session ID)`);
     socket.disconnect();
     return;
   }
@@ -149,28 +144,30 @@ io.on('connection', (socket) => {
   if (sessionMap.has(sessionID)) {
     const session = sessionMap.get(sessionID);
     
-    // Update live socket ID in the map immediately
+    // Update live socket ID
     session.socketId = socket.id;
 
-    // Stop disconnect timer if active
+    // Stop disconnect timer
     if (session.timer) {
       console.log(`Restored session: ${sessionID}`);
       clearTimeout(session.timer);
       session.timer = null;
     }
 
-    // Restore data to the new socket object
+    // Restore data
     socket.userData = session.userData;
     socket.roomID = session.roomID;
 
-    // If they were in a room, rejoin it
+    // Rejoin Room
     if (session.roomID) {
       socket.join(session.roomID);
       socket.to(session.roomID).emit('partner_connected'); 
       socket.emit('session_restored', { status: 'connected' });
-    } 
-    // If they were in the queue, we don't need to do anything because
-    // executeMatch() looks up the socket dynamically via getSocketFromSession()
+    } else {
+      // Update queue reference if waiting
+      const queueItem = waitingQueue.find(q => q.sessionID === sessionID);
+      if (queueItem) queueItem.socket = socket;
+    }
 
   } else {
     // New Session
@@ -189,19 +186,16 @@ io.on('connection', (socket) => {
   // --- SEARCH LOGIC ---
   socket.on('find_partner', (userData) => {
     socket.userData = userData;
-    // Update session data store
     if (sessionMap.has(socket.sessionID)) {
       sessionMap.get(socket.sessionID).userData = userData;
     }
 
-    // Reset Queue state: remove existing entry to avoid duplicates
     removeFromQueue(socket.sessionID);
 
-    const isGenericField = userData.field === '' || userData.field === 'Others';
-
-    // 1. Add to Queue immediately (Store DATA, not SOCKET)
+    // 1. Add to Queue
     const myEntry = { 
       sessionID: socket.sessionID, 
+      socket: socket, // Note: We reference socket here but will fetch fresh one via ID later
       userData: userData, 
       openToAny: false, 
       isMatched: false, 
@@ -209,18 +203,17 @@ io.on('connection', (socket) => {
     };
     waitingQueue.push(myEntry);
 
-    // 2. START 3-SECOND AD TIMER
+    const isGenericField = userData.field === '' || userData.field === 'Others';
+
+    // 2. Wait 3 Seconds (Ad View)
     setTimeout(() => {
-      // Re-fetch entry to see if it's still valid
+      // Check if user is still valid
       const currentEntry = waitingQueue.find(u => u.sessionID === socket.sessionID);
-      
-      // If user left queue or already got matched, stop.
       if (!currentEntry || currentEntry.isMatched) return;
 
-      // --- MATCHING ATTEMPT AFTER 3s ---
       const candidates = waitingQueue.filter(u => u.sessionID !== socket.sessionID && !u.isMatched);
       
-      // A. Priority Match (Same Field)
+      // A. Priority Match
       if (!isGenericField) {
         const exactMatch = candidates.find(u => 
           u.userData.field === userData.field && 
@@ -236,13 +229,13 @@ io.on('connection', (socket) => {
         }
       }
 
-      // B. If no priority match, switch to "Open" mode
+      // B. Switch to Open Mode
       currentEntry.openToAny = true;
 
-      // C. Find any available partner
+      // C. Any Match
       const anyMatch = candidates.find(u => {
-        if (u.openToAny) return true; // They are desperate too
-        return u.userData.field === userData.field; // I fit their priority
+        if (u.openToAny) return true; 
+        return u.userData.field === userData.field;
       });
 
       if (anyMatch) {
@@ -255,15 +248,12 @@ io.on('connection', (socket) => {
   });
 
   socket.on('send_message', (messageData) => {
-    // Robust Send: Always look up room via Session Map
     const session = sessionMap.get(socket.sessionID);
     const currentRoomID = session ? session.roomID : null;
 
     if (currentRoomID) {
-      // Self-healing: Join room if missing
-      if (!socket.rooms.has(currentRoomID)) {
-        socket.join(currentRoomID);
-      }
+      // Force join if missing
+      if (!socket.rooms.has(currentRoomID)) socket.join(currentRoomID);
       
       socket.to(currentRoomID).emit('receive_message', {
         text: messageData.text,
@@ -287,16 +277,14 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', (reason) => {
-    console.log(`Disconnected: ${socket.id} (${reason})`);
+    console.log(`Disconnected: ${socket.id}`);
 
     if (sessionMap.has(socket.sessionID)) {
       const session = sessionMap.get(socket.sessionID);
       
-      // If waiting in queue, remove immediately
       removeFromQueue(socket.sessionID);
 
       if (session.roomID) {
-        // If chatting, wait grace period
         socket.to(session.roomID).emit('partner_reconnecting_server');
         
         session.timer = setTimeout(() => {
