@@ -6,7 +6,7 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
-// Health Check Route
+// Health Check
 app.get("/", (req, res) => {
   res.send("ChatItNow Server is Running!");
 });
@@ -57,11 +57,8 @@ function cleanupSession(sessionID) {
   if (session.roomID) {
     io.to(session.roomID).emit('partner_disconnected');
     
-    // Clear room
-    const room = io.sockets.adapter.rooms.get(session.roomID);
-    if (room) {
-      io.in(session.roomID).socketsLeave(session.roomID);
-    }
+    // Force everyone to leave the room so they don't get ghost messages
+    io.in(session.roomID).socketsLeave(session.roomID);
   }
   
   removeFromQueue(sessionID);
@@ -77,9 +74,6 @@ function matchUsers(socket1, socket2) {
   socket1.join(roomID);
   socket2.join(roomID);
   
-  socket1.roomID = roomID;
-  socket2.roomID = roomID;
-
   // Update session map with room info
   if (socket1.sessionID && sessionMap.has(socket1.sessionID)) {
     sessionMap.get(socket1.sessionID).roomID = roomID;
@@ -149,15 +143,15 @@ io.on('connection', (socket) => {
     // Update socket reference
     session.socketId = socket.id;
     socket.userData = session.userData;
-    socket.roomID = session.roomID;
 
-    // Rejoin Room
+    // CRITICAL FIX: Explicitly rejoin the room if it exists
     if (session.roomID) {
       socket.join(session.roomID);
       socket.to(session.roomID).emit('partner_connected');
+      console.log(`Socket ${socket.id} rejoined room ${session.roomID}`);
     } 
     
-    // Update Queue Reference
+    // Update Queue Reference if they were waiting
     const queueItem = waitingQueue.find(q => q.sessionID === sessionID);
     if (queueItem) {
       queueItem.socket = socket;
@@ -225,20 +219,36 @@ io.on('connection', (socket) => {
     }, 2000);
   });
 
+  // --- SEND MESSAGE (ROBUST) ---
   socket.on('send_message', (messageData) => {
-    if (socket.roomID) {
-      socket.to(socket.roomID).emit('receive_message', {
+    // Lookup roomID from Session Map (Source of Truth)
+    const session = sessionMap.get(socket.sessionID);
+    const currentRoomID = session ? session.roomID : null;
+
+    if (currentRoomID) {
+      // Safety: Ensure socket is actually in the room (Socket.io glitch prevention)
+      if (!socket.rooms.has(currentRoomID)) {
+        console.log(`Socket ${socket.id} missing from room ${currentRoomID}, forcing join.`);
+        socket.join(currentRoomID);
+      }
+
+      socket.to(currentRoomID).emit('receive_message', {
         text: messageData.text,
         type: 'stranger',
         replyTo: messageData.replyTo,
         timestamp: messageData.timestamp
       });
+    } else {
+      console.log(`Socket ${socket.id} tried to send message but has no roomID.`);
     }
   });
 
   socket.on('typing', (isTyping) => {
-    if (socket.roomID) {
-      socket.to(socket.roomID).emit('partner_typing', isTyping);
+    const session = sessionMap.get(socket.sessionID);
+    const currentRoomID = session ? session.roomID : null;
+    
+    if (currentRoomID) {
+      socket.to(currentRoomID).emit('partner_typing', isTyping);
     }
   });
 
