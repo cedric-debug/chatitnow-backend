@@ -6,7 +6,6 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
-// Health Check
 app.get("/", (req, res) => {
   res.send("ChatItNow Server is Running!");
 });
@@ -17,9 +16,8 @@ const PORT = process.env.PORT || 3001;
 // --- CONFIGURATION ---
 const INACTIVITY_LIMIT = 10 * 60 * 1000; // 10 Minutes
 const RECONNECT_GRACE_PERIOD = 3 * 60 * 1000; // 3 Minutes
-const AD_DELAY_MS = 3000; // 3 Seconds mandatory wait
+const AD_DELAY_MS = 3000; // 3 Seconds mandatory wait for Ads
 
-// --- SOCKET SERVER SETUP ---
 const io = new Server(server, {
   connectionStateRecovery: {
     maxDisconnectionDuration: 2 * 60 * 1000,
@@ -44,33 +42,38 @@ function removeFromQueue(sessionID) {
   waitingQueue = waitingQueue.filter(u => u.sessionID !== sessionID);
 }
 
+// Helper to get the LIVE socket object from a session ID
+function getSocketFromSession(sessionID) {
+  const session = sessionMap.get(sessionID);
+  if (!session || !session.socketId) return null;
+  return io.sockets.sockets.get(session.socketId);
+}
+
 function cleanupSession(sessionID) {
   if (!sessionMap.has(sessionID)) return;
   
   const session = sessionMap.get(sessionID);
-  
   if (session.timer) clearTimeout(session.timer);
   
   // Notify partner
   if (session.roomID) {
     io.to(session.roomID).emit('partner_disconnected');
-    // Clear room
-    const room = io.sockets.adapter.rooms.get(session.roomID);
-    if (room) {
-      io.in(session.roomID).socketsLeave(session.roomID);
-    }
+    io.in(session.roomID).socketsLeave(session.roomID);
   }
   
   removeFromQueue(sessionID);
   sessionMap.delete(sessionID);
 }
 
-// Actual connection logic
-function executeMatch(socket1, socket2) {
-  // Verify connectivity
-  if (!socket1.connected || !socket2.connected) {
-    // If one failed, put the survivor back in queue (simple retry)
-    // For simplicity in this demo, we just abort. 
+function executeMatch(sessionID1, sessionID2) {
+  const socket1 = getSocketFromSession(sessionID1);
+  const socket2 = getSocketFromSession(sessionID2);
+
+  // If either socket is gone (disconnected during the wait), abort match
+  // and put the survivor back in queue or cleanup
+  if (!socket1 || !socket2) {
+    if (socket1) removeFromQueue(sessionID1); // Reset state
+    if (socket2) removeFromQueue(sessionID2);
     return;
   }
 
@@ -83,12 +86,12 @@ function executeMatch(socket1, socket2) {
   socket2.roomID = roomID;
 
   // Update session map
-  if (sessionMap.has(socket1.sessionID)) sessionMap.get(socket1.sessionID).roomID = roomID;
-  if (sessionMap.has(socket2.sessionID)) sessionMap.get(socket2.sessionID).roomID = roomID;
+  if (sessionMap.has(sessionID1)) sessionMap.get(sessionID1).roomID = roomID;
+  if (sessionMap.has(sessionID2)) sessionMap.get(sessionID2).roomID = roomID;
 
   // Remove from queue
-  removeFromQueue(socket1.sessionID);
-  removeFromQueue(socket2.sessionID);
+  removeFromQueue(sessionID1);
+  removeFromQueue(sessionID2);
 
   const user1Data = socket1.userData || {};
   const user2Data = socket2.userData || {};
@@ -136,27 +139,30 @@ io.on('connection', (socket) => {
   if (sessionMap.has(sessionID)) {
     const session = sessionMap.get(sessionID);
     
+    // Update live socket ID in the map
+    session.socketId = socket.id;
+
+    // Restore data
+    socket.userData = session.userData;
+    socket.roomID = session.roomID;
+
+    // Stop disconnect timer if active
     if (session.timer) {
       console.log(`Restored session: ${sessionID}`);
       clearTimeout(session.timer);
       session.timer = null;
     }
 
-    session.socketId = socket.id;
-    socket.userData = session.userData;
-    socket.roomID = session.roomID;
-
+    // Rejoin Room logic
     if (session.roomID) {
       socket.join(session.roomID);
       socket.to(session.roomID).emit('partner_connected'); 
       socket.emit('session_restored', { status: 'connected' });
-    } else {
-      // If they were in queue, update socket ref
-      const queueItem = waitingQueue.find(q => q.sessionID === sessionID);
-      if (queueItem) queueItem.socket = socket;
-    }
+    } 
+    // Note: We don't need to update waitingQueue because it stores sessionID, which hasn't changed.
 
   } else {
+    // New Session
     sessionMap.set(sessionID, { 
       socketId: socket.id, 
       roomID: null, 
@@ -176,79 +182,78 @@ io.on('connection', (socket) => {
       sessionMap.get(socket.sessionID).userData = userData;
     }
 
-    // Clean start
+    // 1. Remove from queue if already there (reset search)
     removeFromQueue(socket.sessionID);
 
-    const isGenericField = userData.field === '' || userData.field === 'Others';
-
-    // 1. Add to Queue immediately
+    // 2. Add to Queue immediately
+    // openToAny is initially false (Priority Mode)
     const myEntry = { 
       sessionID: socket.sessionID, 
-      socket: socket, 
       userData: userData, 
-      openToAny: false, // Strict mode initially
-      isMatched: false, // Lock flag
+      openToAny: false, 
+      isMatched: false, 
       joinedAt: Date.now() 
     };
     waitingQueue.push(myEntry);
 
-    // 2. Try to find a PRIORITY match immediately
-    if (!isGenericField) {
-      const candidates = waitingQueue.filter(u => u.sessionID !== socket.sessionID && !u.isMatched);
-      const exactMatch = candidates.find(u => 
-        u.userData.field === userData.field && 
-        u.userData.field !== '' && 
-        u.userData.field !== 'Others'
-      );
+    const isGenericField = userData.field === '' || userData.field === 'Others';
 
-      if (exactMatch) {
-        // MATCH FOUND! 
-        // But we must enforce the 3s delay for the UI to show the ad.
-        myEntry.isMatched = true;
-        exactMatch.isMatched = true;
-
-        setTimeout(() => {
-          executeMatch(socket, exactMatch.socket);
-        }, AD_DELAY_MS);
-        
-        return; // Stop here, we found a match
-      }
-    }
-
-    // 3. If no priority match found, wait for the AD DELAY (3s)
+    // 3. START 3-SECOND AD TIMER
     setTimeout(() => {
-      // Check if user disconnected or got matched by someone else in the meantime
-      if (!socket.connected || myEntry.isMatched) return;
+      // Check if user is still connected and still looking
+      const currentEntry = waitingQueue.find(u => u.sessionID === socket.sessionID);
+      if (!currentEntry || currentEntry.isMatched) return;
 
-      // 4. Time is up! Switch to "Any" mode
-      myEntry.openToAny = true;
-
-      // 5. Look for ANY available partner
-      // We match with:
-      // a) Someone who also wants "Any" (openToAny = true)
-      // b) Someone who wants "My Field" (Priority for them)
+      // --- MATCHING ATTEMPT AFTER 3s ---
+      
       const candidates = waitingQueue.filter(u => u.sessionID !== socket.sessionID && !u.isMatched);
       
-      const match = candidates.find(u => {
-        if (u.openToAny) return true; // They are desperate too
-        return u.userData.field === userData.field; // I am their priority
+      // A. Priority Match (Same Field)
+      if (!isGenericField) {
+        const exactMatch = candidates.find(u => 
+          u.userData.field === userData.field && 
+          u.userData.field !== '' && 
+          u.userData.field !== 'Others'
+        );
+
+        if (exactMatch) {
+          currentEntry.isMatched = true;
+          exactMatch.isMatched = true;
+          executeMatch(socket.sessionID, exactMatch.sessionID);
+          return;
+        }
+      }
+
+      // B. If no priority match, switch to "Open" mode
+      currentEntry.openToAny = true;
+
+      // C. Find any available partner
+      // We match if: 
+      // 1. They are also "Open" (Desperate)
+      // 2. OR if I match THEIR priority field
+      const anyMatch = candidates.find(u => {
+        if (u.openToAny) return true; // They will take anyone
+        return u.userData.field === userData.field; // I fit their preference
       });
 
-      if (match) {
-        myEntry.isMatched = true;
-        match.isMatched = true;
-        executeMatch(socket, match.socket);
+      if (anyMatch) {
+        currentEntry.isMatched = true;
+        anyMatch.isMatched = true;
+        executeMatch(socket.sessionID, anyMatch.sessionID);
       }
 
     }, AD_DELAY_MS);
   });
 
   socket.on('send_message', (messageData) => {
+    // Robust Send: Lookup via Session
     const session = sessionMap.get(socket.sessionID);
     const currentRoomID = session ? session.roomID : null;
 
     if (currentRoomID) {
-      if (!socket.rooms.has(currentRoomID)) socket.join(currentRoomID);
+      if (!socket.rooms.has(currentRoomID)) {
+        socket.join(currentRoomID);
+      }
       
       socket.to(currentRoomID).emit('receive_message', {
         text: messageData.text,
@@ -277,7 +282,7 @@ io.on('connection', (socket) => {
     if (sessionMap.has(socket.sessionID)) {
       const session = sessionMap.get(socket.sessionID);
       
-      // If waiting, remove immediately
+      // If user was just in queue, remove immediately
       removeFromQueue(socket.sessionID);
 
       if (session.roomID) {
