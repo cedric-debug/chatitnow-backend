@@ -15,10 +15,16 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 3001;
 
 // --- CONFIGURATION ---
-const INACTIVITY_LIMIT = 24 * 60 * 60 * 1000; // 24 Hours
-const RECONNECT_GRACE_PERIOD = 24 * 60 * 60 * 1000; // 24 Hours (Wait for user to return)
-const PHASE_1_DELAY = 3000; // 3s Initial Wait (Ad/Priority)
-const PHASE_2_DELAY = 2000; // 2s Secondary Wait (Random)
+
+// 1. AUTO-DISCONNECT: If users don't type/click for 10 minutes, kill the chat.
+const INACTIVITY_LIMIT = 10 * 60 * 1000; 
+
+// 2. BACKGROUND PERSISTENCE: If they close the app/tab, wait 24 hours before giving up.
+// This allows them to Alt-Tab, play a game, and come back without losing the chat.
+const RECONNECT_GRACE_PERIOD = 24 * 60 * 60 * 1000; 
+
+const PHASE_1_DELAY = 3000; // 3s Wait for Ad/Priority
+const PHASE_2_DELAY = 2000; // 2s Wait for Random
 
 const io = new Server(server, {
   connectionStateRecovery: {
@@ -70,9 +76,7 @@ function executeMatch(sessionID1, sessionID2) {
   const socket1 = getSocketFromSession(sessionID1);
   const socket2 = getSocketFromSession(sessionID2);
 
-  // Check if connections are alive
   if (!socket1 || !socket2) {
-    // If one failed, reset the other's match flag
     if (socket1) {
        const entry = waitingQueue.find(u => u.sessionID === sessionID1);
        if (entry) entry.isMatched = false; 
@@ -92,7 +96,6 @@ function executeMatch(sessionID1, sessionID2) {
   socket1.roomID = roomID;
   socket2.roomID = roomID;
 
-  // Link partners
   if (sessionMap.has(sessionID1)) {
     const s1 = sessionMap.get(sessionID1);
     s1.roomID = roomID;
@@ -125,15 +128,20 @@ function executeMatch(sessionID1, sessionID2) {
   });
 }
 
-// --- IDLE CHECKER ---
+// --- IDLE CHECKER (AUTO-DISCONNECT) ---
 setInterval(() => {
   const now = Date.now();
   io.sockets.sockets.forEach((socket) => {
+    // If socket is connected BUT hasn't done anything for 10 mins -> Disconnect
     if (socket.connected && socket.lastActive && (now - socket.lastActive > INACTIVITY_LIMIT)) {
-      socket.disconnect(true);
+      console.log(`Auto-disconnecting idle user: ${socket.id}`);
+      socket.disconnect(true); 
+      // The disconnect handler below will trigger grace period, 
+      // but since the client was forced off, they likely won't reconnect immediately, 
+      // eventually cleaning up the session.
     }
   });
-}, 60 * 1000);
+}, 60 * 1000); // Check every minute
 
 
 // --- MAIN CONNECTION LOGIC ---
@@ -158,7 +166,7 @@ io.on('connection', (socket) => {
     socket.userData = session.userData;
     socket.roomID = session.roomID;
 
-    // Cancel Disconnect Timer (Stale Connection Check logic)
+    // Cancel death timer
     if (session.timer) {
       console.log(`Restored session: ${sessionID}`);
       clearTimeout(session.timer);
@@ -167,21 +175,21 @@ io.on('connection', (socket) => {
 
     if (session.roomID) {
       socket.join(session.roomID);
-      
-      // Notify partner we are back
       socket.to(session.roomID).emit('partner_connected'); 
-      
-      // Notify self
       socket.emit('session_restored', { status: 'connected' });
 
-      // Flush Buffered Messages
       if (session.messageQueue && session.messageQueue.length > 0) {
+        console.log(`Flushing ${session.messageQueue.length} messages to ${sessionID}`);
         session.messageQueue.forEach((msg) => {
           socket.emit('receive_message', msg);
         });
         session.messageQueue = [];
       }
-    } 
+    } else {
+      const queueItem = waitingQueue.find(q => q.sessionID === sessionID);
+      if (queueItem) queueItem.socket = socket;
+    }
+
   } else {
     sessionMap.set(sessionID, { 
       socketId: socket.id, 
@@ -193,15 +201,14 @@ io.on('connection', (socket) => {
     });
   }
 
+  // Update "lastActive" on ANY interaction (typing, message, etc)
   socket.onAny(() => {
     socket.lastActive = Date.now();
   });
 
-  // --- SEARCH LOGIC (Tiered: 3s Priority -> 2s Random) ---
   socket.on('find_partner', (userData) => {
     socket.userData = userData;
 
-    // 1. HARD RESET: Clear old room data to ensure fresh matching
     if (sessionMap.has(socket.sessionID)) {
       const session = sessionMap.get(socket.sessionID);
       session.userData = userData;
@@ -215,7 +222,6 @@ io.on('connection', (socket) => {
 
     removeFromQueue(socket.sessionID);
 
-    // 2. Add to Queue
     const myEntry = { 
       sessionID: socket.sessionID, 
       socket: socket, 
@@ -228,14 +234,12 @@ io.on('connection', (socket) => {
 
     const isGenericField = userData.field === '' || userData.field === 'Others';
 
-    // --- PHASE 1: 3 Seconds Wait (Priority Check) ---
     setTimeout(() => {
       const currentEntry = waitingQueue.find(u => u.sessionID === socket.sessionID);
       if (!currentEntry || currentEntry.isMatched) return;
 
       const candidates = waitingQueue.filter(u => u.sessionID !== socket.sessionID && !u.isMatched);
       
-      // Try Priority
       if (!isGenericField) {
         const exactMatch = candidates.find(u => 
           u.userData.field === userData.field && 
@@ -251,7 +255,6 @@ io.on('connection', (socket) => {
         }
       }
 
-      // --- PHASE 2: 2 Seconds Additional Wait (Random Check) ---
       setTimeout(() => {
         const reCheckEntry = waitingQueue.find(u => u.sessionID === socket.sessionID);
         if (!reCheckEntry || reCheckEntry.isMatched) return;
@@ -273,7 +276,7 @@ io.on('connection', (socket) => {
 
       }, PHASE_2_DELAY);
 
-    }, PHASE_1_DELAY);
+    }, PHASE_1_DELAY); // 3s Ad Delay
   });
 
   socket.on('send_message', (messageData) => {
@@ -293,17 +296,17 @@ io.on('connection', (socket) => {
 
     let sent = false;
 
-    // Attempt instant send
     if (partnerSession && partnerSession.socketId) {
       const partnerSocket = io.sockets.sockets.get(partnerSession.socketId);
+      
       if (partnerSocket && partnerSocket.connected) {
         if (!socket.rooms.has(session.roomID)) socket.join(session.roomID);
+        
         socket.to(session.roomID).emit('receive_message', msgPayload);
         sent = true;
       }
     }
 
-    // Message Queue Buffering
     if (!sent && partnerSession) {
       if (!partnerSession.messageQueue) partnerSession.messageQueue = [];
       partnerSession.messageQueue.push(msgPayload);
@@ -330,10 +333,11 @@ io.on('connection', (socket) => {
   socket.on('disconnect_partner', () => {
     const session = sessionMap.get(socket.sessionID);
     if (session && session.roomID) {
-      // Manual Disconnect: Only notify partner
       socket.to(session.roomID).emit('partner_disconnected');
       io.in(session.roomID).socketsLeave(session.roomID);
       session.roomID = null;
+      session.partnerSessionID = null;
+      session.messageQueue = [];
     }
     removeFromQueue(socket.sessionID);
   });
@@ -344,21 +348,21 @@ io.on('connection', (socket) => {
     if (sessionMap.has(socket.sessionID)) {
       const session = sessionMap.get(socket.sessionID);
       
-      // Stale Connection Check
-      if (session.socketId !== socket.id) return;
-
+      if (session.socketId !== socket.id) return; // Ignore stale
+      
       removeFromQueue(socket.sessionID);
 
       if (session.roomID) {
-        // Notify partner we are trying to reconnect
         socket.to(session.roomID).emit('partner_reconnecting_server');
         
-        // Grace Period
+        // Background persistence (24h)
         session.timer = setTimeout(() => {
+          console.log(`Grace period expired for ${socket.sessionID}`);
           cleanupSession(socket.sessionID);
         }, RECONNECT_GRACE_PERIOD);
       } else {
-        sessionMap.delete(socket.sessionID);
+        // If user wasn't in a chat, we can be more aggressive with cleanup 
+        // or let the queue handle it
       }
     }
   });
