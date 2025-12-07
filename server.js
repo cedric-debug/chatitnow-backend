@@ -6,7 +6,6 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 
-// Health Check
 app.get("/", (req, res) => {
   res.status(200).send("ChatItNow Server is Running!");
 });
@@ -15,16 +14,9 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 3001;
 
 // --- CONFIGURATION ---
-
-// 1. AUTO-DISCONNECT: If users don't type/click for 10 minutes, kill the chat.
-const INACTIVITY_LIMIT = 10 * 60 * 1000; 
-
-// 2. BACKGROUND PERSISTENCE: If they close the app/tab, wait 24 hours before giving up.
-// This allows them to Alt-Tab, play a game, and come back without losing the chat.
 const RECONNECT_GRACE_PERIOD = 24 * 60 * 60 * 1000; 
-
-const PHASE_1_DELAY = 3000; // 3s Wait for Ad/Priority
-const PHASE_2_DELAY = 2000; // 2s Wait for Random
+const PHASE_1_DELAY = 3000; 
+const PHASE_2_DELAY = 2000; 
 
 const io = new Server(server, {
   connectionStateRecovery: {
@@ -39,11 +31,8 @@ const io = new Server(server, {
   }
 });
 
-// --- GLOBAL STATE ---
 let waitingQueue = []; 
 const sessionMap = new Map(); 
-
-// --- HELPER FUNCTIONS ---
 
 function removeFromQueue(sessionID) {
   waitingQueue = waitingQueue.filter(u => u.sessionID !== sessionID);
@@ -57,12 +46,9 @@ function getSocketFromSession(sessionID) {
 
 function cleanupSession(sessionID) {
   if (!sessionMap.has(sessionID)) return;
-  
   const session = sessionMap.get(sessionID);
-  
   if (session.timer) clearTimeout(session.timer);
   
-  // Notify partner
   if (session.roomID) {
     io.to(session.roomID).emit('partner_disconnected');
     io.in(session.roomID).socketsLeave(session.roomID);
@@ -77,14 +63,8 @@ function executeMatch(sessionID1, sessionID2) {
   const socket2 = getSocketFromSession(sessionID2);
 
   if (!socket1 || !socket2) {
-    if (socket1) {
-       const entry = waitingQueue.find(u => u.sessionID === sessionID1);
-       if (entry) entry.isMatched = false; 
-    }
-    if (socket2) {
-       const entry = waitingQueue.find(u => u.sessionID === sessionID2);
-       if (entry) entry.isMatched = false;
-    }
+    if (socket1) { const entry = waitingQueue.find(u => u.sessionID === sessionID1); if (entry) entry.isMatched = false; }
+    if (socket2) { const entry = waitingQueue.find(u => u.sessionID === sessionID2); if (entry) entry.isMatched = false; }
     return;
   }
 
@@ -96,18 +76,12 @@ function executeMatch(sessionID1, sessionID2) {
   socket1.roomID = roomID;
   socket2.roomID = roomID;
 
-  if (sessionMap.has(sessionID1)) {
-    const s1 = sessionMap.get(sessionID1);
-    s1.roomID = roomID;
-    s1.partnerSessionID = sessionID2;
-    s1.messageQueue = [];
-  }
-  if (sessionMap.has(sessionID2)) {
-    const s2 = sessionMap.get(sessionID2);
-    s2.roomID = roomID;
-    s2.partnerSessionID = sessionID1;
-    s2.messageQueue = [];
-  }
+  // Update session data
+  const s1 = sessionMap.get(sessionID1);
+  const s2 = sessionMap.get(sessionID2);
+  
+  if(s1) { s1.roomID = roomID; s1.partnerSessionID = sessionID2; s1.messageQueue = []; }
+  if(s2) { s2.roomID = roomID; s2.partnerSessionID = sessionID1; s2.messageQueue = []; }
 
   removeFromQueue(sessionID1);
   removeFromQueue(sessionID2);
@@ -115,33 +89,25 @@ function executeMatch(sessionID1, sessionID2) {
   const user1Data = socket1.userData || {};
   const user2Data = socket2.userData || {};
 
+  // Send Match Data + Current Read Receipt Settings
   io.to(socket1.id).emit('matched', {
     name: user2Data.username || 'Stranger',
     field: user2Data.field || '',
-    roomID: roomID
+    roomID: roomID,
+    partnerReadReceipts: s2.readReceipts // Inform User 1 of User 2's setting
   });
 
   io.to(socket2.id).emit('matched', {
     name: user1Data.username || 'Stranger',
     field: user1Data.field || '',
-    roomID: roomID
+    roomID: roomID,
+    partnerReadReceipts: s1.readReceipts // Inform User 2 of User 1's setting
   });
 }
 
-// --- IDLE CHECKER (AUTO-DISCONNECT) ---
-setInterval(() => {
-  const now = Date.now();
-  io.sockets.sockets.forEach((socket) => {
-    // If socket is connected BUT hasn't done anything for 10 mins -> Disconnect
-    if (socket.connected && socket.lastActive && (now - socket.lastActive > INACTIVITY_LIMIT)) {
-      console.log(`Auto-disconnecting idle user: ${socket.id}`);
-      socket.disconnect(true); 
-    }
-  });
-}, 60 * 1000); // Check every minute
+// --- IDLE CHECKER (DISABLED) ---
+// setInterval(() => { ... }, 60000); 
 
-
-// --- MAIN CONNECTION LOGIC ---
 io.on('connection', (socket) => {
   const sessionID = socket.handshake.auth.sessionID;
   
@@ -155,17 +121,13 @@ io.on('connection', (socket) => {
 
   console.log(`Connected: ${socket.id}`);
 
-  // --- RECONNECTION HANDLER ---
   if (sessionMap.has(sessionID)) {
     const session = sessionMap.get(sessionID);
-    
     session.socketId = socket.id;
     socket.userData = session.userData;
     socket.roomID = session.roomID;
 
-    // Cancel death timer
     if (session.timer) {
-      console.log(`Restored session: ${sessionID}`);
       clearTimeout(session.timer);
       session.timer = null;
     }
@@ -175,8 +137,14 @@ io.on('connection', (socket) => {
       socket.to(session.roomID).emit('partner_connected'); 
       socket.emit('session_restored', { status: 'connected' });
 
+      // Re-sync read receipt settings on reconnect
+      const partnerID = session.partnerSessionID;
+      const partnerSession = sessionMap.get(partnerID);
+      if (partnerSession) {
+          socket.emit('partner_receipt_setting', partnerSession.readReceipts);
+      }
+
       if (session.messageQueue && session.messageQueue.length > 0) {
-        console.log(`Flushing ${session.messageQueue.length} messages to ${sessionID}`);
         session.messageQueue.forEach((msg) => {
           socket.emit('receive_message', msg);
         });
@@ -188,24 +156,22 @@ io.on('connection', (socket) => {
     }
 
   } else {
+    // New Session - Default readReceipts to true
     sessionMap.set(sessionID, { 
       socketId: socket.id, 
       roomID: null, 
       userData: null, 
       timer: null,
       partnerSessionID: null,
-      messageQueue: []
+      messageQueue: [],
+      readReceipts: true 
     });
   }
 
-  // Update "lastActive" on ANY interaction (typing, message, etc)
-  socket.onAny(() => {
-    socket.lastActive = Date.now();
-  });
+  socket.onAny(() => { socket.lastActive = Date.now(); });
 
   socket.on('find_partner', (userData) => {
     socket.userData = userData;
-
     if (sessionMap.has(socket.sessionID)) {
       const session = sessionMap.get(socket.sessionID);
       session.userData = userData;
@@ -216,7 +182,6 @@ io.on('connection', (socket) => {
       session.partnerSessionID = null;
       session.messageQueue = [];
     }
-
     removeFromQueue(socket.sessionID);
 
     const myEntry = { 
@@ -239,11 +204,8 @@ io.on('connection', (socket) => {
       
       if (!isGenericField) {
         const exactMatch = candidates.find(u => 
-          u.userData.field === userData.field && 
-          u.userData.field !== '' && 
-          u.userData.field !== 'Others'
+          u.userData.field === userData.field && u.userData.field !== '' && u.userData.field !== 'Others'
         );
-
         if (exactMatch) {
           currentEntry.isMatched = true;
           exactMatch.isMatched = true;
@@ -255,25 +217,19 @@ io.on('connection', (socket) => {
       setTimeout(() => {
         const reCheckEntry = waitingQueue.find(u => u.sessionID === socket.sessionID);
         if (!reCheckEntry || reCheckEntry.isMatched) return;
-
         reCheckEntry.openToAny = true;
-
         const openCandidates = waitingQueue.filter(u => u.sessionID !== socket.sessionID && !u.isMatched);
-        
         const anyMatch = openCandidates.find(u => {
           if (u.openToAny) return true; 
           return u.userData.field === userData.field;
         });
-
         if (anyMatch) {
           reCheckEntry.isMatched = true;
           anyMatch.isMatched = true;
           executeMatch(socket.sessionID, anyMatch.sessionID);
         }
-
       }, PHASE_2_DELAY);
-
-    }, PHASE_1_DELAY); // 3s Ad Delay
+    }, PHASE_1_DELAY);
   });
 
   socket.on('send_message', (messageData) => {
@@ -285,7 +241,7 @@ io.on('connection', (socket) => {
 
     const msgPayload = {
       text: messageData.text,
-      audio: messageData.audio, // --- ADDED AUDIO FIELD HERE ---
+      audio: messageData.audio,
       type: 'stranger',
       replyTo: messageData.replyTo,
       timestamp: messageData.timestamp,
@@ -293,13 +249,10 @@ io.on('connection', (socket) => {
     };
 
     let sent = false;
-
     if (partnerSession && partnerSession.socketId) {
       const partnerSocket = io.sockets.sockets.get(partnerSession.socketId);
-      
       if (partnerSocket && partnerSocket.connected) {
         if (!socket.rooms.has(session.roomID)) socket.join(session.roomID);
-        
         socket.to(session.roomID).emit('receive_message', msgPayload);
         sent = true;
       }
@@ -311,13 +264,35 @@ io.on('connection', (socket) => {
     }
   });
 
+  // --- NEW: TOGGLE READ RECEIPTS ---
+  socket.on('toggle_read_receipts', (isEnabled) => {
+    const session = sessionMap.get(socket.sessionID);
+    if(session) {
+      session.readReceipts = isEnabled;
+      if(session.roomID) {
+        socket.to(session.roomID).emit('partner_receipt_setting', isEnabled);
+      }
+    }
+  });
+
+  // --- NEW: MARK MESSAGE AS READ ---
+  socket.on('mark_read', (messageID) => {
+    const session = sessionMap.get(socket.sessionID);
+    if (!session || !session.roomID || !session.partnerSessionID) return;
+
+    // Check privacy logic: Both must be enabled
+    const partnerSession = sessionMap.get(session.partnerSessionID);
+    
+    if (session.readReceipts && partnerSession && partnerSession.readReceipts) {
+       // Send read receipt to partner
+       socket.to(session.roomID).emit('message_read_by_partner', messageID);
+    }
+  });
+
   socket.on('send_reaction', (reactionData) => {
     const session = sessionMap.get(socket.sessionID);
     if (session && session.roomID) {
-      socket.to(session.roomID).emit('receive_reaction', {
-        messageID: reactionData.messageID,
-        reaction: reactionData.reaction
-      });
+      socket.to(session.roomID).emit('receive_reaction', reactionData);
     }
   });
 
@@ -342,25 +317,18 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', (reason) => {
     console.log(`Disconnected: ${socket.id}`);
-
     if (sessionMap.has(socket.sessionID)) {
       const session = sessionMap.get(socket.sessionID);
-      
-      if (session.socketId !== socket.id) return; // Ignore stale
+      if (session.socketId !== socket.id) return; 
       
       removeFromQueue(socket.sessionID);
 
       if (session.roomID) {
         socket.to(session.roomID).emit('partner_reconnecting_server');
-        
-        // Background persistence (24h)
         session.timer = setTimeout(() => {
           console.log(`Grace period expired for ${socket.sessionID}`);
           cleanupSession(socket.sessionID);
         }, RECONNECT_GRACE_PERIOD);
-      } else {
-        // If user wasn't in a chat, we can be more aggressive with cleanup 
-        // or let the queue handle it
       }
     }
   });
