@@ -136,9 +136,6 @@ setInterval(() => {
     if (socket.connected && socket.lastActive && (now - socket.lastActive > INACTIVITY_LIMIT)) {
       console.log(`Auto-disconnecting idle user: ${socket.id}`);
       socket.disconnect(true); 
-      // The disconnect handler below will trigger grace period, 
-      // but since the client was forced off, they likely won't reconnect immediately, 
-      // eventually cleaning up the session.
     }
   });
 }, 60 * 1000); // Check every minute
@@ -288,6 +285,7 @@ io.on('connection', (socket) => {
 
     const msgPayload = {
       text: messageData.text,
+      audio: messageData.audio, // --- ADDED AUDIO FIELD HERE ---
       type: 'stranger',
       replyTo: messageData.replyTo,
       timestamp: messageData.timestamp,
