@@ -19,6 +19,7 @@ const PHASE_1_DELAY = 3000;
 const PHASE_2_DELAY = 2000; 
 
 const io = new Server(server, {
+  maxHttpBufferSize: 1e8, // UPDATED: Allow ~100MB for Images/Videos
   connectionStateRecovery: {
     maxDisconnectionDuration: 2 * 60 * 1000,
     skipMiddlewares: true,
@@ -76,7 +77,6 @@ function executeMatch(sessionID1, sessionID2) {
   socket1.roomID = roomID;
   socket2.roomID = roomID;
 
-  // Update session data
   const s1 = sessionMap.get(sessionID1);
   const s2 = sessionMap.get(sessionID2);
   
@@ -89,24 +89,20 @@ function executeMatch(sessionID1, sessionID2) {
   const user1Data = socket1.userData || {};
   const user2Data = socket2.userData || {};
 
-  // Send Match Data + Current Read Receipt Settings
   io.to(socket1.id).emit('matched', {
     name: user2Data.username || 'Stranger',
     field: user2Data.field || '',
     roomID: roomID,
-    partnerReadReceipts: s2.readReceipts // Inform User 1 of User 2's setting
+    partnerReadReceipts: s2.readReceipts
   });
 
   io.to(socket2.id).emit('matched', {
     name: user1Data.username || 'Stranger',
     field: user1Data.field || '',
     roomID: roomID,
-    partnerReadReceipts: s1.readReceipts // Inform User 2 of User 1's setting
+    partnerReadReceipts: s1.readReceipts
   });
 }
-
-// --- IDLE CHECKER (DISABLED) ---
-// setInterval(() => { ... }, 60000); 
 
 io.on('connection', (socket) => {
   const sessionID = socket.handshake.auth.sessionID;
@@ -137,7 +133,6 @@ io.on('connection', (socket) => {
       socket.to(session.roomID).emit('partner_connected'); 
       socket.emit('session_restored', { status: 'connected' });
 
-      // Re-sync read receipt settings on reconnect
       const partnerID = session.partnerSessionID;
       const partnerSession = sessionMap.get(partnerID);
       if (partnerSession) {
@@ -156,7 +151,6 @@ io.on('connection', (socket) => {
     }
 
   } else {
-    // New Session - Default readReceipts to true
     sessionMap.set(sessionID, { 
       socketId: socket.id, 
       roomID: null, 
@@ -242,6 +236,8 @@ io.on('connection', (socket) => {
     const msgPayload = {
       text: messageData.text,
       audio: messageData.audio,
+      image: messageData.image, // UPDATED: Pass Image
+      video: messageData.video, // UPDATED: Pass Video
       type: 'stranger',
       replyTo: messageData.replyTo,
       timestamp: messageData.timestamp,
@@ -264,7 +260,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- NEW: TOGGLE READ RECEIPTS ---
   socket.on('toggle_read_receipts', (isEnabled) => {
     const session = sessionMap.get(socket.sessionID);
     if(session) {
@@ -275,16 +270,12 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- NEW: MARK MESSAGE AS READ ---
   socket.on('mark_read', (messageID) => {
     const session = sessionMap.get(socket.sessionID);
     if (!session || !session.roomID || !session.partnerSessionID) return;
 
-    // Check privacy logic: Both must be enabled
     const partnerSession = sessionMap.get(session.partnerSessionID);
-    
     if (session.readReceipts && partnerSession && partnerSession.readReceipts) {
-       // Send read receipt to partner
        socket.to(session.roomID).emit('message_read_by_partner', messageID);
     }
   });
