@@ -19,7 +19,7 @@ const PHASE_1_DELAY = 3000;
 const PHASE_2_DELAY = 2000; 
 
 const io = new Server(server, {
-  maxHttpBufferSize: 1e8, // UPDATED: Allow ~100MB for Images/Videos
+  maxHttpBufferSize: 1e8, // 100MB limit
   connectionStateRecovery: {
     maxDisconnectionDuration: 2 * 60 * 1000,
     skipMiddlewares: true,
@@ -236,8 +236,9 @@ io.on('connection', (socket) => {
     const msgPayload = {
       text: messageData.text,
       audio: messageData.audio,
-      image: messageData.image, // UPDATED: Pass Image
-      video: messageData.video, // UPDATED: Pass Video
+      image: messageData.image, 
+      video: messageData.video, 
+      isNSFW: messageData.isNSFW, // <--- FIXED: Now passing the NSFW flag to partner
       type: 'stranger',
       replyTo: messageData.replyTo,
       timestamp: messageData.timestamp,
