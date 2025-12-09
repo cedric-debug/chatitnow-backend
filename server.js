@@ -17,7 +17,7 @@ const PORT = process.env.PORT || 3001;
 const RECONNECT_GRACE_PERIOD = 24 * 60 * 60 * 1000; 
 const PHASE_1_DELAY = 3000; 
 const PHASE_2_DELAY = 2000; 
-const TIMEOUT_DURATION = 15 * 60 * 1000; // 15 Minutes
+const TIMEOUT_DURATION = 15 * 60 * 1000; // 15 Minutes in milliseconds
 
 const io = new Server(server, {
   maxHttpBufferSize: 1e8, // 100MB limit
@@ -36,9 +36,6 @@ const io = new Server(server, {
 let waitingQueue = []; 
 const sessionMap = new Map(); 
 
-// Data Structure: Map<SessionID, Map<TargetSessionID, ExpiryTimestamp>>
-const timeoutMap = new Map(); 
-
 function removeFromQueue(sessionID) {
   waitingQueue = waitingQueue.filter(u => u.sessionID !== sessionID);
 }
@@ -47,6 +44,27 @@ function getSocketFromSession(sessionID) {
   const session = sessionMap.get(sessionID);
   if (!session || !session.socketId) return null;
   return io.sockets.sockets.get(session.socketId);
+}
+
+// Check if User A has timed out User B (or vice versa)
+function isRestricted(sessionID1, sessionID2) {
+  const s1 = sessionMap.get(sessionID1);
+  const s2 = sessionMap.get(sessionID2);
+  const now = Date.now();
+
+  // Check if 1 timed out 2
+  if (s1 && s1.timeouts && s1.timeouts[sessionID2]) {
+    if (now < s1.timeouts[sessionID2]) return true; // Still active
+    delete s1.timeouts[sessionID2]; // Expired
+  }
+
+  // Check if 2 timed out 1
+  if (s2 && s2.timeouts && s2.timeouts[sessionID1]) {
+    if (now < s2.timeouts[sessionID1]) return true; // Still active
+    delete s2.timeouts[sessionID1]; // Expired
+  }
+
+  return false;
 }
 
 function cleanupSession(sessionID) {
@@ -61,33 +79,6 @@ function cleanupSession(sessionID) {
   
   removeFromQueue(sessionID);
   sessionMap.delete(sessionID);
-  // Optional: Clean up timeout map memory for this user, 
-  // but usually we keep it so they can't clear timeouts by reloading
-}
-
-// Check if two users are allowed to match
-function isRestricted(session1, session2) {
-  const now = Date.now();
-
-  // Check if User 1 timed out User 2
-  if (timeoutMap.has(session1)) {
-    const user1Timeouts = timeoutMap.get(session1);
-    if (user1Timeouts.has(session2)) {
-      if (user1Timeouts.get(session2) > now) return true; // Still timed out
-      else user1Timeouts.delete(session2); // Expired
-    }
-  }
-
-  // Check if User 2 timed out User 1
-  if (timeoutMap.has(session2)) {
-    const user2Timeouts = timeoutMap.get(session2);
-    if (user2Timeouts.has(session1)) {
-      if (user2Timeouts.get(session1) > now) return true; 
-      else user2Timeouts.delete(session1);
-    }
-  }
-
-  return false;
 }
 
 function executeMatch(sessionID1, sessionID2) {
@@ -156,6 +147,9 @@ io.on('connection', (socket) => {
     socket.userData = session.userData;
     socket.roomID = session.roomID;
 
+    // Ensure timeouts object exists for old sessions
+    if (!session.timeouts) session.timeouts = {};
+
     if (session.timer) {
       clearTimeout(session.timer);
       session.timer = null;
@@ -191,14 +185,44 @@ io.on('connection', (socket) => {
       timer: null,
       partnerSessionID: null,
       messageQueue: [],
-      readReceipts: true 
+      readReceipts: true,
+      timeouts: {} // Store timed out sessionIDs here
     });
   }
 
   socket.onAny(() => { socket.lastActive = Date.now(); });
 
+  // --- NEW: TIMEOUT HANDLER ---
+  socket.on('timeout_user', () => {
+    const session = sessionMap.get(socket.sessionID);
+    if (!session || !session.partnerSessionID) return;
+
+    const targetID = session.partnerSessionID;
+    
+    // Add to timeout list with timestamp
+    session.timeouts[targetID] = Date.now() + TIMEOUT_DURATION;
+
+    // Trigger disconnect flow similar to 'disconnect_partner'
+    if (session.roomID) {
+      socket.to(session.roomID).emit('partner_disconnected');
+      io.in(session.roomID).socketsLeave(session.roomID);
+      session.roomID = null;
+      session.partnerSessionID = null;
+      session.messageQueue = [];
+    }
+    removeFromQueue(socket.sessionID);
+    
+    // Also clear partner
+    const partnerSession = sessionMap.get(targetID);
+    if(partnerSession) {
+        partnerSession.roomID = null;
+        partnerSession.partnerSessionID = null;
+        removeFromQueue(targetID);
+    }
+  });
+
   socket.on('find_partner', (userData) => {
-    socket.userData = userData;
+    socket.userData = userData; 
     if (sessionMap.has(socket.sessionID)) {
       const session = sessionMap.get(socket.sessionID);
       session.userData = userData;
@@ -227,10 +251,11 @@ io.on('connection', (socket) => {
       const currentEntry = waitingQueue.find(u => u.sessionID === socket.sessionID);
       if (!currentEntry || currentEntry.isMatched) return;
 
+      // Filter candidates: Exclude self, already matched, AND restricted/timed-out users
       const candidates = waitingQueue.filter(u => 
         u.sessionID !== socket.sessionID && 
-        !u.isMatched && 
-        !isRestricted(socket.sessionID, u.sessionID) // <--- Check Timeout/Restrictions
+        !u.isMatched &&
+        !isRestricted(socket.sessionID, u.sessionID) // <--- CHECK TIMEOUTS
       );
       
       if (!isGenericField) {
@@ -250,11 +275,11 @@ io.on('connection', (socket) => {
         if (!reCheckEntry || reCheckEntry.isMatched) return;
         reCheckEntry.openToAny = true;
         
-        // Filter again in Phase 2
+        // Re-filter with restriction check
         const openCandidates = waitingQueue.filter(u => 
           u.sessionID !== socket.sessionID && 
           !u.isMatched &&
-          !isRestricted(socket.sessionID, u.sessionID) // <--- Check Timeout/Restrictions
+          !isRestricted(socket.sessionID, u.sessionID) // <--- CHECK TIMEOUTS
         );
         
         const anyMatch = openCandidates.find(u => {
@@ -268,37 +293,6 @@ io.on('connection', (socket) => {
         }
       }, PHASE_2_DELAY);
     }, PHASE_1_DELAY);
-  });
-
-  socket.on('timeout_partner', () => {
-    const session = sessionMap.get(socket.sessionID);
-    if (!session || !session.partnerSessionID) return;
-
-    const partnerID = session.partnerSessionID;
-
-    // Add to Timeout Map
-    if (!timeoutMap.has(socket.sessionID)) {
-      timeoutMap.set(socket.sessionID, new Map());
-    }
-    const userTimeouts = timeoutMap.get(socket.sessionID);
-    userTimeouts.set(partnerID, Date.now() + TIMEOUT_DURATION);
-
-    // Disconnect them
-    if (session.roomID) {
-      socket.to(session.roomID).emit('partner_disconnected');
-      io.in(session.roomID).socketsLeave(session.roomID);
-      
-      const partnerSession = sessionMap.get(partnerID);
-      session.roomID = null;
-      session.partnerSessionID = null;
-      session.messageQueue = [];
-      
-      if(partnerSession) {
-          partnerSession.roomID = null;
-          partnerSession.partnerSessionID = null;
-      }
-    }
-    removeFromQueue(socket.sessionID);
   });
 
   socket.on('send_message', (messageData) => {
