@@ -89,18 +89,21 @@ function executeMatch(sessionID1, sessionID2) {
   const user1Data = socket1.userData || {};
   const user2Data = socket2.userData || {};
 
+  // --- E2EE UPDATE: Exchanging Public Keys ---
   io.to(socket1.id).emit('matched', {
     name: user2Data.username || 'Stranger',
     field: user2Data.field || '',
     roomID: roomID,
-    partnerReadReceipts: s2.readReceipts
+    partnerReadReceipts: s2.readReceipts,
+    partnerPublicKey: user2Data.publicKey // <--- Send Key to User 1
   });
 
   io.to(socket2.id).emit('matched', {
     name: user1Data.username || 'Stranger',
     field: user1Data.field || '',
     roomID: roomID,
-    partnerReadReceipts: s1.readReceipts
+    partnerReadReceipts: s1.readReceipts,
+    partnerPublicKey: user1Data.publicKey // <--- Send Key to User 2
   });
 }
 
@@ -165,7 +168,7 @@ io.on('connection', (socket) => {
   socket.onAny(() => { socket.lastActive = Date.now(); });
 
   socket.on('find_partner', (userData) => {
-    socket.userData = userData;
+    socket.userData = userData; // userData now contains 'publicKey'
     if (sessionMap.has(socket.sessionID)) {
       const session = sessionMap.get(socket.sessionID);
       session.userData = userData;
@@ -233,12 +236,11 @@ io.on('connection', (socket) => {
     const partnerSessionID = session.partnerSessionID;
     const partnerSession = sessionMap.get(partnerSessionID);
 
+    // --- E2EE UPDATE: Relay Encrypted Payload ---
+    // Instead of reading 'text' or 'image', we relay the 'encrypted' blob
     const msgPayload = {
-      text: messageData.text,
-      audio: messageData.audio,
-      image: messageData.image, 
-      video: messageData.video, 
-      isNSFW: messageData.isNSFW, // <--- FIXED: Now passing the NSFW flag to partner
+      encrypted: messageData.encrypted, // <--- The sealed envelope
+      isNSFW: messageData.isNSFW,       // Exposed metadata for UI blurring logic
       type: 'stranger',
       replyTo: messageData.replyTo,
       timestamp: messageData.timestamp,
@@ -328,4 +330,4 @@ io.on('connection', (socket) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`SERVER RUNNING ON PORT ${PORT}`);
-});
+})
