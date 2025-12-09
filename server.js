@@ -17,6 +17,7 @@ const PORT = process.env.PORT || 3001;
 const RECONNECT_GRACE_PERIOD = 24 * 60 * 60 * 1000; 
 const PHASE_1_DELAY = 3000; 
 const PHASE_2_DELAY = 2000; 
+const TIMEOUT_DURATION = 15 * 60 * 1000; // 15 Minutes
 
 const io = new Server(server, {
   maxHttpBufferSize: 1e8, // 100MB limit
@@ -34,6 +35,9 @@ const io = new Server(server, {
 
 let waitingQueue = []; 
 const sessionMap = new Map(); 
+
+// Data Structure: Map<SessionID, Map<TargetSessionID, ExpiryTimestamp>>
+const timeoutMap = new Map(); 
 
 function removeFromQueue(sessionID) {
   waitingQueue = waitingQueue.filter(u => u.sessionID !== sessionID);
@@ -57,6 +61,33 @@ function cleanupSession(sessionID) {
   
   removeFromQueue(sessionID);
   sessionMap.delete(sessionID);
+  // Optional: Clean up timeout map memory for this user, 
+  // but usually we keep it so they can't clear timeouts by reloading
+}
+
+// Check if two users are allowed to match
+function isRestricted(session1, session2) {
+  const now = Date.now();
+
+  // Check if User 1 timed out User 2
+  if (timeoutMap.has(session1)) {
+    const user1Timeouts = timeoutMap.get(session1);
+    if (user1Timeouts.has(session2)) {
+      if (user1Timeouts.get(session2) > now) return true; // Still timed out
+      else user1Timeouts.delete(session2); // Expired
+    }
+  }
+
+  // Check if User 2 timed out User 1
+  if (timeoutMap.has(session2)) {
+    const user2Timeouts = timeoutMap.get(session2);
+    if (user2Timeouts.has(session1)) {
+      if (user2Timeouts.get(session1) > now) return true; 
+      else user2Timeouts.delete(session1);
+    }
+  }
+
+  return false;
 }
 
 function executeMatch(sessionID1, sessionID2) {
@@ -89,13 +120,12 @@ function executeMatch(sessionID1, sessionID2) {
   const user1Data = socket1.userData || {};
   const user2Data = socket2.userData || {};
 
-  // --- E2EE UPDATE: Exchanging Public Keys ---
   io.to(socket1.id).emit('matched', {
     name: user2Data.username || 'Stranger',
     field: user2Data.field || '',
     roomID: roomID,
     partnerReadReceipts: s2.readReceipts,
-    partnerPublicKey: user2Data.publicKey // <--- Send Key to User 1
+    partnerPublicKey: user2Data.publicKey
   });
 
   io.to(socket2.id).emit('matched', {
@@ -103,7 +133,7 @@ function executeMatch(sessionID1, sessionID2) {
     field: user1Data.field || '',
     roomID: roomID,
     partnerReadReceipts: s1.readReceipts,
-    partnerPublicKey: user1Data.publicKey // <--- Send Key to User 2
+    partnerPublicKey: user1Data.publicKey
   });
 }
 
@@ -168,7 +198,7 @@ io.on('connection', (socket) => {
   socket.onAny(() => { socket.lastActive = Date.now(); });
 
   socket.on('find_partner', (userData) => {
-    socket.userData = userData; // userData now contains 'publicKey'
+    socket.userData = userData;
     if (sessionMap.has(socket.sessionID)) {
       const session = sessionMap.get(socket.sessionID);
       session.userData = userData;
@@ -197,7 +227,11 @@ io.on('connection', (socket) => {
       const currentEntry = waitingQueue.find(u => u.sessionID === socket.sessionID);
       if (!currentEntry || currentEntry.isMatched) return;
 
-      const candidates = waitingQueue.filter(u => u.sessionID !== socket.sessionID && !u.isMatched);
+      const candidates = waitingQueue.filter(u => 
+        u.sessionID !== socket.sessionID && 
+        !u.isMatched && 
+        !isRestricted(socket.sessionID, u.sessionID) // <--- Check Timeout/Restrictions
+      );
       
       if (!isGenericField) {
         const exactMatch = candidates.find(u => 
@@ -215,7 +249,14 @@ io.on('connection', (socket) => {
         const reCheckEntry = waitingQueue.find(u => u.sessionID === socket.sessionID);
         if (!reCheckEntry || reCheckEntry.isMatched) return;
         reCheckEntry.openToAny = true;
-        const openCandidates = waitingQueue.filter(u => u.sessionID !== socket.sessionID && !u.isMatched);
+        
+        // Filter again in Phase 2
+        const openCandidates = waitingQueue.filter(u => 
+          u.sessionID !== socket.sessionID && 
+          !u.isMatched &&
+          !isRestricted(socket.sessionID, u.sessionID) // <--- Check Timeout/Restrictions
+        );
+        
         const anyMatch = openCandidates.find(u => {
           if (u.openToAny) return true; 
           return u.userData.field === userData.field;
@@ -229,6 +270,37 @@ io.on('connection', (socket) => {
     }, PHASE_1_DELAY);
   });
 
+  socket.on('timeout_partner', () => {
+    const session = sessionMap.get(socket.sessionID);
+    if (!session || !session.partnerSessionID) return;
+
+    const partnerID = session.partnerSessionID;
+
+    // Add to Timeout Map
+    if (!timeoutMap.has(socket.sessionID)) {
+      timeoutMap.set(socket.sessionID, new Map());
+    }
+    const userTimeouts = timeoutMap.get(socket.sessionID);
+    userTimeouts.set(partnerID, Date.now() + TIMEOUT_DURATION);
+
+    // Disconnect them
+    if (session.roomID) {
+      socket.to(session.roomID).emit('partner_disconnected');
+      io.in(session.roomID).socketsLeave(session.roomID);
+      
+      const partnerSession = sessionMap.get(partnerID);
+      session.roomID = null;
+      session.partnerSessionID = null;
+      session.messageQueue = [];
+      
+      if(partnerSession) {
+          partnerSession.roomID = null;
+          partnerSession.partnerSessionID = null;
+      }
+    }
+    removeFromQueue(socket.sessionID);
+  });
+
   socket.on('send_message', (messageData) => {
     const session = sessionMap.get(socket.sessionID);
     if (!session || !session.roomID) return;
@@ -236,11 +308,9 @@ io.on('connection', (socket) => {
     const partnerSessionID = session.partnerSessionID;
     const partnerSession = sessionMap.get(partnerSessionID);
 
-    // --- E2EE UPDATE: Relay Encrypted Payload ---
-    // Instead of reading 'text' or 'image', we relay the 'encrypted' blob
     const msgPayload = {
-      encrypted: messageData.encrypted, // <--- The sealed envelope
-      isNSFW: messageData.isNSFW,       // Exposed metadata for UI blurring logic
+      encrypted: messageData.encrypted,
+      isNSFW: messageData.isNSFW,
       type: 'stranger',
       replyTo: messageData.replyTo,
       timestamp: messageData.timestamp,
@@ -330,4 +400,4 @@ io.on('connection', (socket) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`SERVER RUNNING ON PORT ${PORT}`);
-})
+});
